@@ -1,0 +1,29 @@
+# Local experiment outputs and model artifacts
+runs/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.npz
+*.npy
+*.mat
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.json
+*.csv
+*.log
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS/editor metadata
+.DS_Store
+.idea/
+.vscode/
