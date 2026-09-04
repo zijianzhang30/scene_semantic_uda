@@ -53,12 +53,37 @@ def shift_view(x, src_mean, src_std, tgt_mean, tgt_std, strength=.7):
  lf=F.avg_pool2d(torch.randn_like(y),kernel_size=5,stride=1,padding=2)
  return (y*scale + 0.015*lf).clamp(0,1)
 
+class LearnableSceneShift(nn.Module):
+ def __init__(self,bands=48):
+  super().__init__(); self.net=nn.Sequential(nn.Conv1d(2,32,5,padding=2),nn.GELU(),nn.Conv1d(32,2,5,padding=2))
+ def forward(self,x,tmean,tstd):
+  stats=torch.stack([tmean,tstd])[None]
+  ab=torch.tanh(self.net(stats))*0.08
+  return (x*(1+ab[:,0,:,None,None])+ab[:,1,:,None,None]).clamp(0,1)
+
 def aug(x):
  if torch.rand(())<.5: x=x.flip(-1)
  if torch.rand(())<.5: x=x.flip(-2)
  return x
 
 def orth_loss(a,b): return orthogonality_loss(a,b)
+
+def class_struct_loss(z,y,margin=1.0):
+ centers=[]
+ for k in range(7):
+  m=y==k
+  centers.append(z[m].mean(0) if m.any() else z.mean(0))
+ centers=torch.stack(centers)
+ compact=0.
+ for k in range(7):
+  m=y==k
+  if m.any(): compact=compact + (z[m]-centers[k]).pow(2).mean()
+ pairs=[]
+ for i in range(7):
+  for j in range(i+1,7):
+   pairs.append(F.relu(margin-(centers[i]-centers[j]).norm()).pow(2))
+ margin_loss=torch.stack(pairs).mean() if pairs else torch.zeros((),device=z.device,dtype=z.dtype)
+ return compact/7, margin_loss
 
 def train_one(args):
  set_seed(args.optimization_seed); dev=torch.device(args.device)
@@ -76,19 +101,23 @@ def train_one(args):
  train_loader=DataLoader(TensorDataset(torch.from_numpy(trx),torch.from_numpy(try_)),batch_size=args.batch_size,shuffle=True,drop_last=True)
  val_loader=DataLoader(TensorDataset(torch.from_numpy(vax),torch.from_numpy(vay)),batch_size=args.batch_size)
  target_loader=DataLoader(torch.from_numpy(tx_all),batch_size=args.batch_size,shuffle=True,drop_last=True)
- model=SemanticSceneUDA().to(dev); opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4); ce=nn.CrossEntropyLoss()
+ model=SemanticSceneUDA().to(dev); shift_net=LearnableSceneShift(ds.shape[-1]).to(dev) if args.learnable_shift else None; opt=torch.optim.AdamW(list(model.parameters())+(list(shift_net.parameters()) if shift_net else []),lr=args.lr,weight_decay=1e-4); ce=nn.CrossEntropyLoss()
  hist=[]; best={'val_acc':-1}
  for ep in range(1,args.epochs+1):
-  model.train(); it=iter(target_loader); sums={k:0. for k in ('total','cls','sem','orth','align')}; cor=n=0
+  model.train(); it=iter(target_loader); sums={k:0. for k in ('total','cls','sem','orth','align','shift','compact','margin')}; cor=n=0
   for xs,ys in train_loader:
    try: xt=next(it)
    except StopIteration: it=iter(target_loader); xt=next(it)
-   xs,ys,xt=xs.to(dev),ys.to(dev),xt.to(dev); xs_shift=shift_view(xs,sm,ss,tm,ts)
+   xs,ys,xt=xs.to(dev),ys.to(dev),xt.to(dev); xs_shift=shift_net(xs,torch.as_tensor(tm,device=dev),torch.as_tensor(ts,device=dev)) if shift_net else shift_view(xs,sm,ss,tm,ts)
    _,zs,ds_,logits=model(aug(xs)); _,zss,dss,logits_shift=model(aug(xs_shift)); _,zt,dt_,lt=model(aug(aug(xt))); _,ztw,_,ltw=model(xt)
    lcls=ce(logits,ys)
    if args.scene_shift: lcls=lcls+0.5*ce(logits_shift,ys)
    lsem=(1-F.cosine_similarity(zs,zss,dim=1)).mean() if args.semantic else torch.zeros((),device=dev)
    lorth=orth_loss(zs,ds_) if args.semantic else torch.zeros((),device=dev)
+   lcompact=torch.zeros((),device=dev); lmargin=torch.zeros((),device=dev)
+   if args.class_struct:
+    zs_all=torch.cat([zs,zss],0); ys_all=torch.cat([ys,ys],0)
+    lcompact,lmargin=class_struct_loss(zs_all,ys_all)
    lalign=torch.zeros((),device=dev)
    if args.alignment:
     probw=ltw.softmax(1); probs=lt.softmax(1); conf=probw.max(1).values.detach(); pseudo=probw.argmax(1).detach()
@@ -104,18 +133,19 @@ def train_one(args):
       w=rel[mask]; ct=(zt[mask]*w[:,None]).sum(0)/(w.sum()+1e-6); prot.append((w.mean()*(cs-ct).pow(2).mean()))
      else: prot.append(torch.zeros((),device=dev))
     lalign=torch.stack(prot).mean()
-   total=lcls + args.lambda_sem*lsem + args.lambda_orth*lorth + args.lambda_align*lalign
+   lshift=(xs_shift.mean((0,2,3))-torch.as_tensor(tm,device=dev)).abs().mean()+args.shift_beta*(xs_shift.std((0,2,3))-torch.as_tensor(ts,device=dev)).abs().mean() if shift_net else torch.zeros((),device=dev)
+   total=lcls + args.lambda_sem*lsem + args.lambda_orth*lorth + args.lambda_align*lalign + args.lambda_shift*lshift + args.lambda_compact*lcompact + args.lambda_margin*lmargin
    opt.zero_grad(); total.backward(); opt.step(); bs=len(ys); n+=bs; cor+=(logits.argmax(1)==ys).sum().item()
-   for k,v in (('total',total),('cls',lcls),('sem',lsem),('orth',lorth),('align',lalign)): sums[k]+=v.item()*bs
+   for k,v in (('total',total),('cls',lcls),('sem',lsem),('orth',lorth),('align',lalign),('shift',lshift),('compact',lcompact),('margin',lmargin)): sums[k]+=v.item()*bs
   model.eval(); vc=vl=vn=0
   with torch.no_grad():
    for x,y in val_loader:
     _,z,d_,o=model(x.to(dev)); y=y.to(dev); vl+=ce(o,y).item()*len(y); vc+=(o.argmax(1)==y).sum().item(); vn+=len(y)
-  row={'epoch':ep,'train_loss':sums['total']/n,'loss_cls':sums['cls']/n,'loss_sem':sums['sem']/n,'loss_orth':sums['orth']/n,'loss_align':sums['align']/n,'train_acc':cor/n,'val_loss':vl/vn,'val_acc':vc/vn}; hist.append(row)
+  row={'epoch':ep,'train_loss':sums['total']/n,'loss_cls':sums['cls']/n,'loss_sem':sums['sem']/n,'loss_orth':sums['orth']/n,'loss_align':sums['align']/n,'loss_shift':sums['shift']/n,'loss_compact':sums['compact']/n,'loss_margin':sums['margin']/n,'train_acc':cor/n,'val_loss':vl/vn,'val_acc':vc/vn}; hist.append(row)
   print(json.dumps(row),flush=True)
   if row['val_acc']>best['val_acc']: best=row.copy(); torch.save({'model':model.state_dict(),'split_seed':args.split_seed,'optimization_seed':args.optimization_seed,'config':vars(args),'best':best,'target_gt_used_for_training_or_selection':False},args.output/'best.pth')
  cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; (args.output/'history.json').write_text(json.dumps(hist,indent=2)); (args.output/'summary.json').write_text(json.dumps({'config':cfg,'best':best,'target_gt_used_for_training_or_selection':False},indent=2))
 
 if __name__=='__main__':
- ap=argparse.ArgumentParser(); ap.add_argument('--stage',choices=['baseline','scene_shift','scene_shift_sem','scene_shift_sem_orth','semantic','reliable_alignment','full'],default='baseline'); ap.add_argument('--split-seed',type=int,required=True); ap.add_argument('--optimization-seed',type=int,default=1174); ap.add_argument('--epochs',type=int,default=100); ap.add_argument('--batch-size',type=int,default=32); ap.add_argument('--lr',type=float,default=2e-3); ap.add_argument('--lambda-sem',type=float,default=.2); ap.add_argument('--lambda-orth',type=float,default=.01); ap.add_argument('--lambda-align',type=float,default=.1); ap.add_argument('--conf-threshold',type=float,default=.8); ap.add_argument('--device',default='cuda:0'); ap.add_argument('--output',type=Path,required=True)
- a=ap.parse_args(); a.semantic=a.stage in ('scene_shift_sem','scene_shift_sem_orth','semantic','reliable_alignment','full'); a.scene_shift=a.stage in ('scene_shift','scene_shift_sem','scene_shift_sem_orth','semantic','reliable_alignment','full'); a.alignment=a.stage in ('reliable_alignment','full'); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
+ ap=argparse.ArgumentParser(); ap.add_argument('--stage',choices=['baseline','scene_shift','scene_shift_class_struct','scene_shift_sem','scene_shift_sem_orth','learnable_scene_shift','semantic','reliable_alignment','full'],default='baseline'); ap.add_argument('--split-seed',type=int,required=True); ap.add_argument('--optimization-seed',type=int,default=1174); ap.add_argument('--epochs',type=int,default=100); ap.add_argument('--batch-size',type=int,default=32); ap.add_argument('--lr',type=float,default=2e-3); ap.add_argument('--lambda-sem',type=float,default=.2); ap.add_argument('--lambda-orth',type=float,default=.01); ap.add_argument('--lambda-align',type=float,default=.1); ap.add_argument('--lambda-shift',type=float,default=.1); ap.add_argument('--lambda-compact',type=float,default=.05); ap.add_argument('--lambda-margin',type=float,default=.01); ap.add_argument('--shift-beta',type=float,default=.5); ap.add_argument('--conf-threshold',type=float,default=.8); ap.add_argument('--device',default='cuda:0'); ap.add_argument('--output',type=Path,required=True)
+ a=ap.parse_args(); a.learnable_shift=a.stage=='learnable_scene_shift'; a.class_struct=a.stage=='scene_shift_class_struct'; a.semantic=a.stage in ('scene_shift_sem','scene_shift_sem_orth','semantic','reliable_alignment','full'); a.scene_shift=a.stage in ('scene_shift','scene_shift_class_struct','scene_shift_sem','scene_shift_sem_orth','learnable_scene_shift','semantic','reliable_alignment','full'); a.alignment=a.stage in ('reliable_alignment','full'); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
