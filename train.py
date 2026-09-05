@@ -1,151 +1,415 @@
-"""Houston scene-shift / semantic-scene disentanglement UDA prototype.
+"""Houston Target-Guided Scene Shift and Foundation Reliability training.
 
-This is intentionally independent of the legacy MLUDA/HyperSIGMA code. Target
-GT is never loaded by training; it is only consumed by the separate evaluator.
+Target ground truth is never loaded here. HyperSIGMA features are read from an
+offline cache whose target sample universe is the complete, unlabeled image.
+Target ground truth is consumed only by the separate post-hoc evaluator.
 """
 from __future__ import annotations
-import argparse, json, math, random
+
+import argparse
+import json
+import random
+import sys
 from pathlib import Path
-import hdf5storage, numpy as np, torch
+
+import hdf5storage
+import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-import sys
-ROOT=Path('/home/zhangzj26/TGRS_MLUDA-2024'); sys.path.insert(0,str(ROOT)); sys.path.insert(0,str(Path(__file__).resolve().parent))
-from UtilsCMS import ILDA
-import utils
-from model import SemanticSceneUDA, orthogonality_loss
-from config_Houston import HalfWidth
+
+ROOT = Path("/home/zhangzj26/TGRS_MLUDA-2024")
+HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(ROOT), str(HERE)]
+
+from config_Houston import HalfWidth  # noqa: E402
+from model import SemanticSceneUDA  # noqa: E402
+from UtilsCMS import ILDA  # noqa: E402
+import utils  # noqa: E402
+
+CLASSES = 7
+FOUNDATION_CACHE = HERE / "cache" / "hypersigma_fspec_full48_all_target.npz"
+
 
 def center_patches(cube, centers, width):
-    h=width//2; pad=np.pad(cube,((h,h),(h,h),(0,0)),mode='constant'); out=np.empty((len(centers),cube.shape[-1],width,width),np.float32)
-    for i,(r,c) in enumerate(centers): out[i]=pad[r:r+width,c:c+width].transpose(2,0,1)
-    return out
+    half = width // 2
+    padded = np.pad(cube, ((half, half), (half, half), (0, 0)), mode="constant")
+    output = np.empty((len(centers), cube.shape[-1], width, width), np.float32)
+    for i, (row, col) in enumerate(centers):
+        output[i] = padded[row:row + width, col:col + width].transpose(2, 0, 1)
+    return output
+
+
 def paired_source_samples(adapted, raw, gt, seed):
-    rng=np.random.RandomState(seed); pgt=np.pad(gt,HalfWidth); rows,cols=np.nonzero(pgt); tr=[]; va=[]
-    for cls in range(int(pgt.max())):
-        inds=[j for j in range(len(rows)) if pgt[rows[j],cols[j]]==cls+1]; rng.shuffle(inds); tr+=inds[:180]; va+=inds[180:]
-    rng.shuffle(tr); rng.shuffle(va); tc=np.asarray([(rows[j]-HalfWidth,cols[j]-HalfWidth) for j in tr],np.int64); vc=np.asarray([(rows[j]-HalfWidth,cols[j]-HalfWidth) for j in va],np.int64)
-    return tc,center_patches(adapted,tc,7),center_patches(raw,tc,33),gt[tc[:,0],tc[:,1]].astype(np.int64)-1,vc,center_patches(adapted,vc,7),center_patches(raw,vc,33),gt[vc[:,0],vc[:,1]].astype(np.int64)-1
+    rng = np.random.RandomState(seed)
+    padded_gt = np.pad(gt, HalfWidth)
+    rows, cols = np.nonzero(padded_gt)
+    train_indices, val_indices = [], []
+    for cls in range(int(padded_gt.max())):
+        indices = [i for i in range(len(rows)) if padded_gt[rows[i], cols[i]] == cls + 1]
+        rng.shuffle(indices)
+        train_indices += indices[:180]
+        val_indices += indices[180:]
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    train_centers = np.asarray(
+        [(rows[i] - HalfWidth, cols[i] - HalfWidth) for i in train_indices], dtype=np.int64
+    )
+    val_centers = np.asarray(
+        [(rows[i] - HalfWidth, cols[i] - HalfWidth) for i in val_indices], dtype=np.int64
+    )
+    train_labels = gt[train_centers[:, 0], train_centers[:, 1]].astype(np.int64) - 1
+    val_labels = gt[val_centers[:, 0], val_centers[:, 1]].astype(np.int64) - 1
+    return (
+        train_centers,
+        center_patches(adapted, train_centers, 7),
+        center_patches(raw, train_centers, 33),
+        train_labels,
+        val_centers,
+        center_patches(adapted, val_centers, 7),
+        center_patches(raw, val_centers, 33),
+        val_labels,
+    )
 
-def set_seed(s):
- random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
-class SpectralSpatialMambaLite(nn.Module):
- def __init__(self, bands=48, classes=7):
-  super().__init__()
-  self.spec=nn.Sequential(nn.Conv3d(1,32,(7,1,1),stride=(2,1,1)),nn.BatchNorm3d(32),nn.GELU(),nn.Conv3d(32,64,(5,1,1),stride=(2,1,1)),nn.BatchNorm3d(64),nn.GELU())
-  self.spat=nn.Sequential(nn.Conv2d(bands,64,3,padding=1),nn.BatchNorm2d(64),nn.GELU(),nn.Conv2d(64,64,3,padding=1),nn.BatchNorm2d(64),nn.GELU())
-  self.fuse=nn.Sequential(nn.Conv2d(128,128,1),nn.BatchNorm2d(128),nn.GELU())
-  self.sem=nn.Sequential(nn.Linear(128,128),nn.LayerNorm(128),nn.GELU())
-  self.scene=nn.Sequential(nn.Linear(128,64),nn.LayerNorm(64),nn.GELU())
-  self.cls=nn.Linear(128,classes)
- def forward(self,x):
-  a=self.spec(x.unsqueeze(1)).mean(2); b=self.spat(x); h=self.fuse(torch.cat([a,b],1)).mean((2,3)); return self.sem(h),self.scene(h),self.cls(self.sem(h))
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-def shift_view(x, src_mean, src_std, tgt_mean, tgt_std, strength=.7):
- # label-preserving target-like spectral perturbation; smooth scaling and low
- # frequency noise are shared across the 7x7 patch.
- sm=torch.as_tensor(src_mean,device=x.device,dtype=x.dtype)[None,:,None,None]; ss=torch.as_tensor(src_std,device=x.device,dtype=x.dtype)[None,:,None,None]
- tm=torch.as_tensor(tgt_mean,device=x.device,dtype=x.dtype)[None,:,None,None]; ts=torch.as_tensor(tgt_std,device=x.device,dtype=x.dtype)[None,:,None,None]
- y=(x-sm)/(ss+1e-5)*(strength*ts+(1-strength)*ss)+strength*tm+(1-strength)*sm
- scale=1+0.04*torch.randn(x.size(0),1,1,1,device=x.device)
- lf=F.avg_pool2d(torch.randn_like(y),kernel_size=5,stride=1,padding=2)
- return (y*scale + 0.015*lf).clamp(0,1)
 
-class LearnableSceneShift(nn.Module):
- def __init__(self,bands=48):
-  super().__init__(); self.net=nn.Sequential(nn.Conv1d(2,32,5,padding=2),nn.GELU(),nn.Conv1d(32,2,5,padding=2))
- def forward(self,x,tmean,tstd):
-  stats=torch.stack([tmean,tstd])[None]
-  ab=torch.tanh(self.net(stats))*0.08
-  return (x*(1+ab[:,0,:,None,None])+ab[:,1,:,None,None]).clamp(0,1)
+def shift_view(x, src_mean, src_std, tgt_mean, tgt_std, strength=0.7):
+    """Validated handcrafted, label-preserving target-guided Scene Shift."""
+    src_mean = torch.as_tensor(src_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    src_std = torch.as_tensor(src_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    tgt_mean = torch.as_tensor(tgt_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    tgt_std = torch.as_tensor(tgt_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    shifted = (x - src_mean) / (src_std + 1e-5)
+    shifted = shifted * (strength * tgt_std + (1.0 - strength) * src_std)
+    shifted = shifted + strength * tgt_mean + (1.0 - strength) * src_mean
+    scale = 1.0 + 0.04 * torch.randn(x.size(0), 1, 1, 1, device=x.device)
+    low_frequency_noise = F.avg_pool2d(
+        torch.randn_like(shifted), kernel_size=5, stride=1, padding=2
+    )
+    return (shifted * scale + 0.015 * low_frequency_noise).clamp(0, 1)
 
-def aug(x):
- if torch.rand(())<.5: x=x.flip(-1)
- if torch.rand(())<.5: x=x.flip(-2)
- return x
 
-def orth_loss(a,b): return orthogonality_loss(a,b)
+def augment(x):
+    if torch.rand(()) < 0.5:
+        x = x.flip(-1)
+    if torch.rand(()) < 0.5:
+        x = x.flip(-2)
+    return x
 
-def class_struct_loss(z,y,margin=1.0):
- centers=[]
- for k in range(7):
-  m=y==k
-  centers.append(z[m].mean(0) if m.any() else z.mean(0))
- centers=torch.stack(centers)
- compact=0.
- for k in range(7):
-  m=y==k
-  if m.any(): compact=compact + (z[m]-centers[k]).pow(2).mean()
- pairs=[]
- for i in range(7):
-  for j in range(i+1,7):
-   pairs.append(F.relu(margin-(centers[i]-centers[j]).norm()).pow(2))
- margin_loss=torch.stack(pairs).mean() if pairs else torch.zeros((),device=z.device,dtype=z.dtype)
- return compact/7, margin_loss
+
+def _full_image_centers(shape):
+    return np.argwhere(np.ones(shape, dtype=bool)).astype(np.int64)
+
+
+def load_foundation_cache(cache_path, train_centers, train_labels, target_centers):
+    """Load an exact-coordinate cache and build fixed source-train centers."""
+    cache_path = Path(cache_path)
+    if not cache_path.is_file():
+        raise FileNotFoundError(
+            f"Foundation cache not found: {cache_path}. Run prepare_foundation_cache.py first."
+        )
+    required = {"source_centers", "source_fspec", "target_centers", "target_fspec"}
+    with np.load(cache_path, allow_pickle=False) as cache:
+        missing = required.difference(cache.files)
+        if missing:
+            raise RuntimeError(f"Foundation cache is missing arrays: {sorted(missing)}")
+        if "target_gt_used_for_cache" not in cache.files:
+            raise RuntimeError("Foundation cache lacks target-GT provenance metadata")
+        if bool(np.asarray(cache["target_gt_used_for_cache"]).item()):
+            raise RuntimeError("Refusing a foundation cache whose target sample set used target GT")
+
+        cached_source_centers = np.asarray(cache["source_centers"], dtype=np.int64)
+        source_features = np.asarray(cache["source_fspec"], dtype=np.float32)
+        cached_target_centers = np.asarray(cache["target_centers"], dtype=np.int64)
+        target_features = np.asarray(cache["target_fspec"], dtype=np.float32)
+        teacher_checkpoint = str(np.asarray(cache.get("teacher_checkpoint", "unknown")).item())
+
+    if len(cached_source_centers) != len(source_features):
+        raise RuntimeError("Source center/feature lengths differ in foundation cache")
+    if len(cached_target_centers) != len(target_features):
+        raise RuntimeError("Target center/feature lengths differ in foundation cache")
+    if cached_source_centers.ndim != 2 or cached_source_centers.shape[1] != 2:
+        raise RuntimeError("Invalid source center shape in foundation cache")
+    if not np.array_equal(cached_target_centers, target_centers):
+        raise RuntimeError(
+            "Target cache must cover the complete unlabeled image in exact row-major order"
+        )
+    if not np.isfinite(source_features).all() or not np.isfinite(target_features).all():
+        raise RuntimeError("Foundation cache contains NaN/Inf")
+
+    source_index = {tuple(center): i for i, center in enumerate(cached_source_centers)}
+    try:
+        train_features = np.stack(
+            [source_features[source_index[tuple(center)]] for center in train_centers]
+        )
+    except KeyError as exc:
+        raise RuntimeError(f"Source training center missing from foundation cache: {exc.args[0]}") from exc
+
+    class_centers = []
+    for cls in range(CLASSES):
+        mask = train_labels == cls
+        if not np.any(mask):
+            raise RuntimeError(f"Source training split has no samples for class {cls}")
+        class_centers.append(train_features[mask].mean(axis=0))
+    class_centers = np.stack(class_centers).astype(np.float32)
+    if np.any(np.linalg.norm(class_centers, axis=1) <= 1e-12):
+        raise RuntimeError("Foundation source class center has zero norm")
+    return target_features, class_centers, teacher_checkpoint
+
+
+def foundation_weighted_consistency(weak_logits, strong_logits, teacher_features,
+                                    teacher_class_centers, tau_h):
+    """Return detached reliability-weighted KL and label-free diagnostics."""
+    with torch.no_grad():
+        weak_prob = F.softmax(weak_logits, dim=1)
+        weak_class = weak_prob.argmax(dim=1)
+        strong_class = strong_logits.argmax(dim=1)
+        teacher_similarity = F.linear(
+            F.normalize(teacher_features, dim=1),
+            F.normalize(teacher_class_centers, dim=1),
+        )
+        foundation_prob = F.softmax(teacher_similarity / tau_h, dim=1)
+        foundation_class = foundation_prob.argmax(dim=1)
+
+        student_agreement = weak_class.eq(strong_class)
+        foundation_agreement = weak_class.eq(foundation_class)
+        student_reliability = weak_prob.max(dim=1).values * student_agreement
+        foundation_reliability = foundation_prob.max(dim=1).values * foundation_agreement
+        reliability = (student_reliability * foundation_reliability).detach()
+
+    per_sample_kl = F.kl_div(
+        F.log_softmax(strong_logits, dim=1),
+        weak_prob.detach(),
+        reduction="none",
+    ).sum(dim=1)
+    loss = (reliability * per_sample_kl).sum() / reliability.sum().clamp_min(1e-6)
+    diagnostics = {
+        "reliability": reliability.mean(),
+        "reliable_fraction": (reliability > 0).float().mean(),
+        "student_agreement": student_agreement.float().mean(),
+        "foundation_agreement": foundation_agreement.float().mean(),
+        "foundation_confidence": foundation_prob.max(dim=1).values.mean(),
+    }
+    return loss, diagnostics
+
 
 def train_one(args):
- set_seed(args.optimization_seed); dev=torch.device(args.device)
- src,sg=utils.load_data_houston(str(ROOT/'datasets/Houston/Houston13.mat'),str(ROOT/'datasets/Houston/Houston13_7gt.mat'))
- # Training reads target imagery only.  The target GT file is intentionally
- # not opened here; it is consumed only by eval.py after training.
- tgt=hdf5storage.loadmat(str(ROOT/'datasets/Houston/Houston18.mat'))['ori_data']
- ds,dt=ILDA(src,tgt,2,0.009)
- trc, trx, _, try_, vac, vax, _, vay=paired_source_samples(ds,ds,sg,args.split_seed)
- # Source statistics and target statistics are unlabeled and computed from cubes.
- sm,ss=ds.reshape(-1,ds.shape[-1]).mean(0),ds.reshape(-1,ds.shape[-1]).std(0)
- tm,ts=dt.reshape(-1,dt.shape[-1]).mean(0),dt.reshape(-1,dt.shape[-1]).std(0)
- target_centers=np.argwhere(np.ones(dt.shape[:2],bool)).astype(np.int64)
- tx_all=center_patches(dt,target_centers,7)
- train_loader=DataLoader(TensorDataset(torch.from_numpy(trx),torch.from_numpy(try_)),batch_size=args.batch_size,shuffle=True,drop_last=True)
- val_loader=DataLoader(TensorDataset(torch.from_numpy(vax),torch.from_numpy(vay)),batch_size=args.batch_size)
- target_loader=DataLoader(torch.from_numpy(tx_all),batch_size=args.batch_size,shuffle=True,drop_last=True)
- model=SemanticSceneUDA().to(dev); shift_net=LearnableSceneShift(ds.shape[-1]).to(dev) if args.learnable_shift else None; opt=torch.optim.AdamW(list(model.parameters())+(list(shift_net.parameters()) if shift_net else []),lr=args.lr,weight_decay=1e-4); ce=nn.CrossEntropyLoss()
- hist=[]; best={'val_acc':-1}
- for ep in range(1,args.epochs+1):
-  model.train(); it=iter(target_loader); sums={k:0. for k in ('total','cls','sem','orth','align','shift','compact','margin')}; cor=n=0
-  for xs,ys in train_loader:
-   try: xt=next(it)
-   except StopIteration: it=iter(target_loader); xt=next(it)
-   xs,ys,xt=xs.to(dev),ys.to(dev),xt.to(dev); xs_shift=shift_net(xs,torch.as_tensor(tm,device=dev),torch.as_tensor(ts,device=dev)) if shift_net else shift_view(xs,sm,ss,tm,ts)
-   _,zs,ds_,logits=model(aug(xs)); _,zss,dss,logits_shift=model(aug(xs_shift)); _,zt,dt_,lt=model(aug(aug(xt))); _,ztw,_,ltw=model(xt)
-   lcls=ce(logits,ys)
-   if args.scene_shift: lcls=lcls+0.5*ce(logits_shift,ys)
-   lsem=(1-F.cosine_similarity(zs,zss,dim=1)).mean() if args.semantic else torch.zeros((),device=dev)
-   lorth=orth_loss(zs,ds_) if args.semantic else torch.zeros((),device=dev)
-   lcompact=torch.zeros((),device=dev); lmargin=torch.zeros((),device=dev)
-   if args.class_struct:
-    zs_all=torch.cat([zs,zss],0); ys_all=torch.cat([ys,ys],0)
-    lcompact,lmargin=class_struct_loss(zs_all,ys_all)
-   lalign=torch.zeros((),device=dev)
-   if args.alignment:
-    probw=ltw.softmax(1); probs=lt.softmax(1); conf=probw.max(1).values.detach(); pseudo=probw.argmax(1).detach()
-    consistency=(probw.argmax(1)==probs.argmax(1)).float().detach()
-    prot=[]
-    src_proto=torch.stack([zs[ys==k].mean(0) if (ys==k).any() else zs.mean(0) for k in range(7)])
-    sim=F.cosine_similarity(ztw[:,None,:],src_proto[None,:,:],dim=2).max(1).values.detach().clamp_min(0)
-    rel=(conf*consistency*sim).detach()
-    for k in range(7):
-     cs=zs[ys==k].mean(0) if (ys==k).any() else zs.mean(0)
-     mask=(pseudo==k)&(conf>args.conf_threshold)&(consistency>0)&(sim>0)
-     if mask.any():
-      w=rel[mask]; ct=(zt[mask]*w[:,None]).sum(0)/(w.sum()+1e-6); prot.append((w.mean()*(cs-ct).pow(2).mean()))
-     else: prot.append(torch.zeros((),device=dev))
-    lalign=torch.stack(prot).mean()
-   lshift=(xs_shift.mean((0,2,3))-torch.as_tensor(tm,device=dev)).abs().mean()+args.shift_beta*(xs_shift.std((0,2,3))-torch.as_tensor(ts,device=dev)).abs().mean() if shift_net else torch.zeros((),device=dev)
-   total=lcls + args.lambda_sem*lsem + args.lambda_orth*lorth + args.lambda_align*lalign + args.lambda_shift*lshift + args.lambda_compact*lcompact + args.lambda_margin*lmargin
-   opt.zero_grad(); total.backward(); opt.step(); bs=len(ys); n+=bs; cor+=(logits.argmax(1)==ys).sum().item()
-   for k,v in (('total',total),('cls',lcls),('sem',lsem),('orth',lorth),('align',lalign),('shift',lshift),('compact',lcompact),('margin',lmargin)): sums[k]+=v.item()*bs
-  model.eval(); vc=vl=vn=0
-  with torch.no_grad():
-   for x,y in val_loader:
-    _,z,d_,o=model(x.to(dev)); y=y.to(dev); vl+=ce(o,y).item()*len(y); vc+=(o.argmax(1)==y).sum().item(); vn+=len(y)
-  row={'epoch':ep,'train_loss':sums['total']/n,'loss_cls':sums['cls']/n,'loss_sem':sums['sem']/n,'loss_orth':sums['orth']/n,'loss_align':sums['align']/n,'loss_shift':sums['shift']/n,'loss_compact':sums['compact']/n,'loss_margin':sums['margin']/n,'train_acc':cor/n,'val_loss':vl/vn,'val_acc':vc/vn}; hist.append(row)
-  print(json.dumps(row),flush=True)
-  if row['val_acc']>best['val_acc']: best=row.copy(); torch.save({'model':model.state_dict(),'split_seed':args.split_seed,'optimization_seed':args.optimization_seed,'config':vars(args),'best':best,'target_gt_used_for_training_or_selection':False},args.output/'best.pth')
- cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; (args.output/'history.json').write_text(json.dumps(hist,indent=2)); (args.output/'summary.json').write_text(json.dumps({'config':cfg,'best':best,'target_gt_used_for_training_or_selection':False},indent=2))
+    set_seed(args.optimization_seed)
+    device = torch.device(args.device)
+    source, source_gt = utils.load_data_houston(
+        str(ROOT / "datasets/Houston/Houston13.mat"),
+        str(ROOT / "datasets/Houston/Houston13_7gt.mat"),
+    )
+    # Only target imagery is opened during training. Target GT is post-hoc only.
+    target = hdf5storage.loadmat(str(ROOT / "datasets/Houston/Houston18.mat"))["ori_data"]
+    adapted_source, adapted_target = ILDA(source, target, 2, 0.009)
+    train_centers, train_x, _, train_y, _, val_x, _, val_y = paired_source_samples(
+        adapted_source, adapted_source, source_gt, args.split_seed
+    )
 
-if __name__=='__main__':
- ap=argparse.ArgumentParser(); ap.add_argument('--stage',choices=['baseline','scene_shift','scene_shift_class_struct','scene_shift_sem','scene_shift_sem_orth','learnable_scene_shift','semantic','reliable_alignment','full'],default='baseline'); ap.add_argument('--split-seed',type=int,required=True); ap.add_argument('--optimization-seed',type=int,default=1174); ap.add_argument('--epochs',type=int,default=100); ap.add_argument('--batch-size',type=int,default=32); ap.add_argument('--lr',type=float,default=2e-3); ap.add_argument('--lambda-sem',type=float,default=.2); ap.add_argument('--lambda-orth',type=float,default=.01); ap.add_argument('--lambda-align',type=float,default=.1); ap.add_argument('--lambda-shift',type=float,default=.1); ap.add_argument('--lambda-compact',type=float,default=.05); ap.add_argument('--lambda-margin',type=float,default=.01); ap.add_argument('--shift-beta',type=float,default=.5); ap.add_argument('--conf-threshold',type=float,default=.8); ap.add_argument('--device',default='cuda:0'); ap.add_argument('--output',type=Path,required=True)
- a=ap.parse_args(); a.learnable_shift=a.stage=='learnable_scene_shift'; a.class_struct=a.stage=='scene_shift_class_struct'; a.semantic=a.stage in ('scene_shift_sem','scene_shift_sem_orth','semantic','reliable_alignment','full'); a.scene_shift=a.stage in ('scene_shift','scene_shift_class_struct','scene_shift_sem','scene_shift_sem_orth','learnable_scene_shift','semantic','reliable_alignment','full'); a.alignment=a.stage in ('reliable_alignment','full'); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
+    source_flat = adapted_source.reshape(-1, adapted_source.shape[-1])
+    target_flat = adapted_target.reshape(-1, adapted_target.shape[-1])
+    source_mean, source_std = source_flat.mean(0), source_flat.std(0)
+    target_mean, target_std = target_flat.mean(0), target_flat.std(0)
+    target_centers = _full_image_centers(adapted_target.shape[:2])
+    target_x = center_patches(adapted_target, target_centers, 7)
+
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)),
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(val_x), torch.from_numpy(val_y)),
+        batch_size=args.batch_size,
+    )
+
+    teacher_class_centers = None
+    teacher_checkpoint = None
+    if args.foundation_reliability:
+        target_teacher_features, class_centers, teacher_checkpoint = load_foundation_cache(
+            args.foundation_cache, train_centers, train_y, target_centers
+        )
+        teacher_class_centers = torch.from_numpy(class_centers).to(device)
+        target_dataset = TensorDataset(
+            torch.from_numpy(target_x), torch.from_numpy(target_teacher_features)
+        )
+    else:
+        target_dataset = torch.from_numpy(target_x)
+    target_loader = DataLoader(
+        target_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    model = SemanticSceneUDA().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    cross_entropy = nn.CrossEntropyLoss()
+    history = []
+    best = {"val_acc": -1.0}
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        target_iterator = iter(target_loader)
+        sums = {
+            key: 0.0 for key in (
+                "total", "classification", "target", "reliability",
+                "reliable_fraction", "student_agreement", "foundation_agreement",
+                "foundation_confidence",
+            )
+        }
+        correct = total_samples = 0
+        for source_x, source_y in train_loader:
+            try:
+                target_batch = next(target_iterator)
+            except StopIteration:
+                target_iterator = iter(target_loader)
+                target_batch = next(target_iterator)
+
+            if args.foundation_reliability:
+                target_x_batch, teacher_features = target_batch
+                teacher_features = teacher_features.to(device)
+            else:
+                target_x_batch = target_batch
+                teacher_features = None
+            source_x = source_x.to(device)
+            source_y = source_y.to(device)
+            target_x_batch = target_x_batch.to(device)
+            shifted_source = shift_view(
+                source_x, source_mean, source_std, target_mean, target_std
+            )
+
+            source_logits = model(augment(source_x))[3]
+            shifted_logits = model(augment(shifted_source))[3]
+            # Preserve the established weak/raw and strong/two-pass flip views.
+            strong_target_logits = model(augment(augment(target_x_batch)))[3]
+            weak_target_logits = model(target_x_batch)[3]
+
+            classification_loss = cross_entropy(source_logits, source_y)
+            if args.scene_shift:
+                classification_loss = classification_loss + 0.5 * cross_entropy(
+                    shifted_logits, source_y
+                )
+
+            target_loss = torch.zeros((), device=device)
+            reliability_stats = {
+                key: torch.zeros((), device=device) for key in (
+                    "reliability", "reliable_fraction", "student_agreement",
+                    "foundation_agreement", "foundation_confidence",
+                )
+            }
+            if args.foundation_reliability:
+                target_loss, reliability_stats = foundation_weighted_consistency(
+                    weak_target_logits,
+                    strong_target_logits,
+                    teacher_features,
+                    teacher_class_centers,
+                    args.tau_h,
+                )
+
+            loss = classification_loss + args.lambda_target * target_loss
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            batch_size = len(source_y)
+            total_samples += batch_size
+            correct += (source_logits.argmax(1) == source_y).sum().item()
+            sums["total"] += loss.item() * batch_size
+            sums["classification"] += classification_loss.item() * batch_size
+            sums["target"] += target_loss.item() * batch_size
+            for key, value in reliability_stats.items():
+                sums[key] += value.item() * batch_size
+
+        model.eval()
+        val_correct = val_samples = 0
+        val_loss_sum = 0.0
+        with torch.no_grad():
+            for val_batch, labels in val_loader:
+                logits = model(val_batch.to(device))[3]
+                labels = labels.to(device)
+                val_loss_sum += cross_entropy(logits, labels).item() * len(labels)
+                val_correct += (logits.argmax(1) == labels).sum().item()
+                val_samples += len(labels)
+
+        row = {
+            "epoch": epoch,
+            "train_loss": sums["total"] / total_samples,
+            "loss_cls": sums["classification"] / total_samples,
+            "loss_target": sums["target"] / total_samples,
+            "reliability_mean": sums["reliability"] / total_samples,
+            "reliable_fraction": sums["reliable_fraction"] / total_samples,
+            "student_agreement": sums["student_agreement"] / total_samples,
+            "foundation_agreement": sums["foundation_agreement"] / total_samples,
+            "foundation_confidence": sums["foundation_confidence"] / total_samples,
+            "train_acc": correct / total_samples,
+            "val_loss": val_loss_sum / val_samples,
+            "val_acc": val_correct / val_samples,
+        }
+        history.append(row)
+        print(json.dumps(row), flush=True)
+        if row["val_acc"] > best["val_acc"]:
+            best = row.copy()
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "split_seed": args.split_seed,
+                    "optimization_seed": args.optimization_seed,
+                    "config": vars(args),
+                    "best": best,
+                    "teacher_checkpoint": teacher_checkpoint,
+                    "teacher_centers_updated": False,
+                    "target_gt_used_for_training_or_selection": False,
+                },
+                args.output / "best.pth",
+            )
+
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    (args.output / "history.json").write_text(json.dumps(history, indent=2))
+    (args.output / "summary.json").write_text(json.dumps({
+        "config": config,
+        "best": best,
+        "teacher_checkpoint": teacher_checkpoint,
+        "teacher_centers_updated": False,
+        "target_gt_used_for_training_or_selection": False,
+    }, indent=2))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stage",
+        choices=("baseline", "scene_shift", "scene_shift_foundation_reliability"),
+        default="scene_shift",
+    )
+    parser.add_argument("--split-seed", type=int, required=True)
+    parser.add_argument("--optimization-seed", type=int, default=1174)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--lambda-target", type=float, default=0.1)
+    parser.add_argument("--tau-h", type=float, default=0.1)
+    parser.add_argument("--foundation-cache", type=Path, default=FOUNDATION_CACHE)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    args.scene_shift = args.stage != "baseline"
+    args.foundation_reliability = args.stage == "scene_shift_foundation_reliability"
+    args.output.mkdir(parents=True, exist_ok=True)
+    return args
+
+
+if __name__ == "__main__":
+    train_one(parse_args())
