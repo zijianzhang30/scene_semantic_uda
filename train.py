@@ -1,8 +1,14 @@
-"""Houston Target-Guided Scene Shift and Foundation Reliability training.
+"""Clean four-group DCRN / GuidedPGC(Scene Shift) audit.
 
-Target ground truth is never loaded here. HyperSIGMA features are read from an
-offline cache whose target sample universe is the complete, unlabeled image.
-Target ground truth is consumed only by the separate post-hoc evaluator.
+The only train-time choices are:
+
+  A: raw DCRN + CE
+  B: raw DCRN + handcrafted Scene Shift
+  C: GuidedPGC(ILDA) + DCRN + CE
+  D: GuidedPGC(ILDA) + DCRN + handcrafted Scene Shift
+
+No foundation, semantic, orthogonal, prototype, modulation, LMMD, SCL or
+contrastive branch is imported or enabled here. Target GT is never loaded.
 """
 from __future__ import annotations
 
@@ -18,21 +24,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 ROOT = Path("/home/zhangzj26/TGRS_MLUDA-2024")
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT), str(HERE)]
 
 from config_Houston import HalfWidth  # noqa: E402
-from model import SemanticSceneUDA  # noqa: E402
-from UtilsCMS import ILDA  # noqa: E402
+from model import DCRNClassifier  # noqa: E402
 import utils  # noqa: E402
 
-CLASSES = 7
-FOUNDATION_CACHE = HERE / "cache" / "hypersigma_fspec_full48_all_target.npz"
+# Registered clean Step-1 source splits.  The optimization seed remains fixed
+# at 1174 for every split so A/B are strictly matched.
+SPLITS = (1174, 1370, 1417, 1418, 1421, 1535, 1546, 1599, 1610, 1631, 1703, 2141)
+GROUPS = ("A", "B", "C", "D")
+GROUP_DESCRIPTIONS = {
+    "A": "DCRN + CE",
+    "B": "DCRN + Scene Shift",
+    "C": "GuidedPGC(ILDA) + DCRN + CE",
+    "D": "GuidedPGC(ILDA) + DCRN + Scene Shift",
+}
 
 
-def center_patches(cube, centers, width):
+def center_patches(cube, centers, width=7):
     half = width // 2
     padded = np.pad(cube, ((half, half), (half, half), (0, 0)), mode="constant")
     output = np.empty((len(centers), cube.shape[-1], width, width), np.float32)
@@ -41,16 +56,17 @@ def center_patches(cube, centers, width):
     return output
 
 
-def paired_source_samples(adapted, raw, gt, seed):
+def source_split(gt, seed):
+    """Keep the established 180-per-class source split exactly matched."""
     rng = np.random.RandomState(seed)
-    padded_gt = np.pad(gt, HalfWidth)
-    rows, cols = np.nonzero(padded_gt)
+    padded = np.pad(gt, HalfWidth)
+    rows, cols = np.nonzero(padded)
     train_indices, val_indices = [], []
-    for cls in range(int(padded_gt.max())):
-        indices = [i for i in range(len(rows)) if padded_gt[rows[i], cols[i]] == cls + 1]
+    for cls in range(int(padded.max())):
+        indices = [i for i in range(len(rows)) if padded[rows[i], cols[i]] == cls + 1]
         rng.shuffle(indices)
-        train_indices += indices[:180]
-        val_indices += indices[180:]
+        train_indices.extend(indices[:180])
+        val_indices.extend(indices[180:])
     rng.shuffle(train_indices)
     rng.shuffle(val_indices)
     train_centers = np.asarray(
@@ -59,18 +75,9 @@ def paired_source_samples(adapted, raw, gt, seed):
     val_centers = np.asarray(
         [(rows[i] - HalfWidth, cols[i] - HalfWidth) for i in val_indices], dtype=np.int64
     )
-    train_labels = gt[train_centers[:, 0], train_centers[:, 1]].astype(np.int64) - 1
-    val_labels = gt[val_centers[:, 0], val_centers[:, 1]].astype(np.int64) - 1
-    return (
-        train_centers,
-        center_patches(adapted, train_centers, 7),
-        center_patches(raw, train_centers, 33),
-        train_labels,
-        val_centers,
-        center_patches(adapted, val_centers, 7),
-        center_patches(raw, val_centers, 33),
-        val_labels,
-    )
+    train_y = gt[train_centers[:, 0], train_centers[:, 1]].astype(np.int64) - 1
+    val_y = gt[val_centers[:, 0], val_centers[:, 1]].astype(np.int64) - 1
+    return train_centers, train_y, val_centers, val_y
 
 
 def set_seed(seed):
@@ -78,22 +85,6 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def shift_view(x, src_mean, src_std, tgt_mean, tgt_std, strength=0.7):
-    """Validated handcrafted, label-preserving target-guided Scene Shift."""
-    src_mean = torch.as_tensor(src_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
-    src_std = torch.as_tensor(src_std, device=x.device, dtype=x.dtype)[None, :, None, None]
-    tgt_mean = torch.as_tensor(tgt_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
-    tgt_std = torch.as_tensor(tgt_std, device=x.device, dtype=x.dtype)[None, :, None, None]
-    shifted = (x - src_mean) / (src_std + 1e-5)
-    shifted = shifted * (strength * tgt_std + (1.0 - strength) * src_std)
-    shifted = shifted + strength * tgt_mean + (1.0 - strength) * src_mean
-    scale = 1.0 + 0.04 * torch.randn(x.size(0), 1, 1, 1, device=x.device)
-    low_frequency_noise = F.avg_pool2d(
-        torch.randn_like(shifted), kernel_size=5, stride=1, padding=2
-    )
-    return (shifted * scale + 0.015 * low_frequency_noise).clamp(0, 1)
 
 
 def augment(x):
@@ -104,122 +95,212 @@ def augment(x):
     return x
 
 
-def _full_image_centers(shape):
-    return np.argwhere(np.ones(shape, dtype=bool)).astype(np.int64)
+def scene_shift(x, source_mean, source_std, target_mean, target_std, strength=0.7):
+    """The validated handcrafted Target-Guided Scene Shift, unchanged."""
+    source_mean = torch.as_tensor(source_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    source_std = torch.as_tensor(source_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    target_mean = torch.as_tensor(target_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    target_std = torch.as_tensor(target_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    shifted = (x - source_mean) / (source_std + 1e-5)
+    shifted = shifted * (strength * target_std + (1.0 - strength) * source_std)
+    shifted = shifted + strength * target_mean + (1.0 - strength) * source_mean
+    scale = 1.0 + 0.04 * torch.randn(x.size(0), 1, 1, 1, device=x.device)
+    low_frequency_noise = F.avg_pool2d(
+        torch.randn_like(shifted), kernel_size=5, stride=1, padding=2
+    )
+    return (shifted * scale + 0.015 * low_frequency_noise).clamp(0, 1)
 
 
-def load_foundation_cache(cache_path, train_centers, train_labels, target_centers):
-    """Load an exact-coordinate cache and build fixed source-train centers."""
-    cache_path = Path(cache_path)
-    if not cache_path.is_file():
-        raise FileNotFoundError(
-            f"Foundation cache not found: {cache_path}. Run prepare_foundation_cache.py first."
-        )
-    required = {"source_centers", "source_fspec", "target_centers", "target_fspec"}
-    with np.load(cache_path, allow_pickle=False) as cache:
-        missing = required.difference(cache.files)
-        if missing:
-            raise RuntimeError(f"Foundation cache is missing arrays: {sorted(missing)}")
-        if "target_gt_used_for_cache" not in cache.files:
-            raise RuntimeError("Foundation cache lacks target-GT provenance metadata")
-        if bool(np.asarray(cache["target_gt_used_for_cache"]).item()):
-            raise RuntimeError("Refusing a foundation cache whose target sample set used target GT")
-
-        cached_source_centers = np.asarray(cache["source_centers"], dtype=np.int64)
-        source_features = np.asarray(cache["source_fspec"], dtype=np.float32)
-        cached_target_centers = np.asarray(cache["target_centers"], dtype=np.int64)
-        target_features = np.asarray(cache["target_fspec"], dtype=np.float32)
-        teacher_checkpoint = str(np.asarray(cache.get("teacher_checkpoint", "unknown")).item())
-
-    if len(cached_source_centers) != len(source_features):
-        raise RuntimeError("Source center/feature lengths differ in foundation cache")
-    if len(cached_target_centers) != len(target_features):
-        raise RuntimeError("Target center/feature lengths differ in foundation cache")
-    if cached_source_centers.ndim != 2 or cached_source_centers.shape[1] != 2:
-        raise RuntimeError("Invalid source center shape in foundation cache")
-    if not np.array_equal(cached_target_centers, target_centers):
-        raise RuntimeError(
-            "Target cache must cover the complete unlabeled image in exact row-major order"
-        )
-    if not np.isfinite(source_features).all() or not np.isfinite(target_features).all():
-        raise RuntimeError("Foundation cache contains NaN/Inf")
-
-    source_index = {tuple(center): i for i, center in enumerate(cached_source_centers)}
-    try:
-        train_features = np.stack(
-            [source_features[source_index[tuple(center)]] for center in train_centers]
-        )
-    except KeyError as exc:
-        raise RuntimeError(f"Source training center missing from foundation cache: {exc.args[0]}") from exc
-
-    class_centers = []
-    for cls in range(CLASSES):
-        mask = train_labels == cls
-        if not np.any(mask):
-            raise RuntimeError(f"Source training split has no samples for class {cls}")
-        class_centers.append(train_features[mask].mean(axis=0))
-    class_centers = np.stack(class_centers).astype(np.float32)
-    if np.any(np.linalg.norm(class_centers, axis=1) <= 1e-12):
-        raise RuntimeError("Foundation source class center has zero norm")
-    return target_features, class_centers, teacher_checkpoint
+def build_band_adaptive_strength(source_mean, source_std, target_mean, target_std,
+                                 alpha_min=0.4, alpha_max=0.8):
+    """Deterministic source/target global-statistics band adaptation."""
+    def normalize(values):
+        values = np.asarray(values, dtype=np.float32)
+        lo, hi = float(values.min()), float(values.max())
+        return (values - lo) / max(hi - lo, 1e-8)
+    delta_mu = normalize(np.abs(target_mean - source_mean))
+    delta_std = normalize(np.abs(target_std - source_std))
+    score = normalize(delta_mu + delta_std)
+    alpha = alpha_min + score * (alpha_max - alpha_min)
+    return score.astype(np.float32), alpha.astype(np.float32)
 
 
-def foundation_weighted_consistency(weak_logits, strong_logits, teacher_features,
-                                    teacher_class_centers, tau_h):
-    """Return detached reliability-weighted KL and label-free diagnostics."""
-    with torch.no_grad():
-        weak_prob = F.softmax(weak_logits, dim=1)
-        weak_class = weak_prob.argmax(dim=1)
-        strong_class = strong_logits.argmax(dim=1)
-        teacher_similarity = F.linear(
-            F.normalize(teacher_features, dim=1),
-            F.normalize(teacher_class_centers, dim=1),
-        )
-        foundation_prob = F.softmax(teacher_similarity / tau_h, dim=1)
-        foundation_class = foundation_prob.argmax(dim=1)
+def band_adaptive_scene_shift(x, source_mean, source_std, target_mean, target_std,
+                              alpha, strength_noise=True):
+    sm = torch.as_tensor(source_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    ss = torch.as_tensor(source_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    tm = torch.as_tensor(target_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    ts = torch.as_tensor(target_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    a = torch.as_tensor(alpha, device=x.device, dtype=x.dtype)[None, :, None, None]
+    mu_mix = (1.0 - a) * sm + a * tm
+    std_mix = (1.0 - a) * ss + a * ts
+    shifted = (x - sm) / (ss + 1e-5) * std_mix + mu_mix
+    scale = 1.0 + 0.04 * torch.randn(x.size(0), 1, 1, 1, device=x.device)
+    low_frequency_noise = F.avg_pool2d(
+        torch.randn_like(shifted), kernel_size=5, stride=1, padding=2
+    )
+    return (shifted * scale + 0.015 * low_frequency_noise).clamp(0, 1)
 
-        student_agreement = weak_class.eq(strong_class)
-        foundation_agreement = weak_class.eq(foundation_class)
-        student_reliability = weak_prob.max(dim=1).values * student_agreement
-        foundation_reliability = foundation_prob.max(dim=1).values * foundation_agreement
-        reliability = (student_reliability * foundation_reliability).detach()
 
-    per_sample_kl = F.kl_div(
-        F.log_softmax(strong_logits, dim=1),
-        weak_prob.detach(),
-        reduction="none",
-    ).sum(dim=1)
-    loss = (reliability * per_sample_kl).sum() / reliability.sum().clamp_min(1e-6)
-    diagnostics = {
-        "reliability": reliability.mean(),
-        "reliable_fraction": (reliability > 0).float().mean(),
-        "student_agreement": student_agreement.float().mean(),
-        "foundation_agreement": foundation_agreement.float().mean(),
-        "foundation_confidence": foundation_prob.max(dim=1).values.mean(),
-    }
-    return loss, diagnostics
+def build_target_modes(target, n_modes=4, seed=1174):
+    """Unsupervised target spectral modes; target labels are never consulted."""
+    pixels = target.reshape(-1, target.shape[-1]).astype(np.float32)
+    scaler = StandardScaler().fit(pixels)
+    z = scaler.transform(pixels)
+    # Fit on a deterministic subsample for bounded memory/time, then retain
+    # centers in the original spectral domain for per-band statistics.
+    rng = np.random.RandomState(seed)
+    take = min(len(z), 50000)
+    ids = rng.choice(len(z), take, replace=False)
+    km = KMeans(n_clusters=n_modes, random_state=seed, n_init=10).fit(z[ids])
+    labels = km.predict(z)
+    modes = []
+    for mode in range(n_modes):
+        members = pixels[labels == mode]
+        if len(members) == 0:
+            members = pixels
+        modes.append({"mean": members.mean(0), "std": members.std(0) + 1e-5})
+    mode_signatures = np.stack([m["mean"] for m in modes])
+    return modes, mode_signatures
+
+
+def conditional_scene_shift(x, source_mean, source_std, modes, mode_signatures, strength=0.7):
+    """Scene Shift with source-sample-specific soft target spectral modes."""
+    b = x.shape[0]
+    source_signature = x.mean(dim=(-1, -2))
+    signatures = torch.as_tensor(mode_signatures, device=x.device, dtype=x.dtype)
+    source_signature = F.normalize(source_signature, dim=1)
+    signatures = F.normalize(signatures, dim=1)
+    weights = torch.softmax(source_signature @ signatures.t() / 0.1, dim=1)
+    target_mean = torch.as_tensor(np.stack([m["mean"] for m in modes]), device=x.device, dtype=x.dtype)
+    target_std = torch.as_tensor(np.stack([m["std"] for m in modes]), device=x.device, dtype=x.dtype)
+    target_mean = weights @ target_mean
+    target_std = weights @ target_std
+    sm = torch.as_tensor(source_mean, device=x.device, dtype=x.dtype)[None, :, None, None]
+    ss = torch.as_tensor(source_std, device=x.device, dtype=x.dtype)[None, :, None, None]
+    tm = target_mean[:, :, None, None]
+    ts = target_std[:, :, None, None]
+    shifted = (x - sm) / (ss + 1e-5)
+    shifted = shifted * (strength * ts + (1.0 - strength) * ss)
+    shifted = shifted + strength * tm + (1.0 - strength) * sm
+    scale = 1.0 + 0.04 * torch.randn(b, 1, 1, 1, device=x.device)
+    low_frequency_noise = F.avg_pool2d(torch.randn_like(shifted), kernel_size=5, stride=1, padding=2)
+    return (shifted * scale + 0.015 * low_frequency_noise).clamp(0, 1)
+
+
+def build_target_neighbors(target, radius=2, top_k=4, threshold=0.85):
+    """Build local target-only spectral neighbors without reading target GT."""
+    height, width, bands = target.shape
+    spectra = target.reshape(-1, bands).astype(np.float32)
+    spectra /= np.maximum(np.linalg.norm(spectra, axis=1, keepdims=True), 1e-8)
+    neighbor_ids = np.full((height * width, top_k), -1, dtype=np.int64)
+    neighbor_sims = np.zeros((height * width, top_k), dtype=np.float32)
+    for row in range(height):
+        for col in range(width):
+            center = row * width + col
+            candidates = []
+            for dr in range(-radius, radius + 1):
+                for dc in range(-radius, radius + 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    rr, cc = row + dr, col + dc
+                    if 0 <= rr < height and 0 <= cc < width:
+                        idx = rr * width + cc
+                        sim = float(np.dot(spectra[center], spectra[idx]))
+                        if sim >= threshold:
+                            candidates.append((sim, idx))
+            candidates.sort(reverse=True)
+            for slot, (sim, idx) in enumerate(candidates[:top_k]):
+                neighbor_ids[center, slot] = idx
+                neighbor_sims[center, slot] = sim
+    return neighbor_ids, neighbor_sims
+
+
+def neighborhood_consistency(model, center_x, neighbor_x, similarity,
+                             confidence_threshold=0.7, active_fraction=1.0):
+    """One-way high-confidence-to-low-confidence target neighborhood KL."""
+    logits_i = model(center_x)
+    logits_j = model(neighbor_x)
+    p_i, p_j = logits_i.softmax(1), logits_j.softmax(1)
+    conf_i, conf_j = p_i.max(1).values, p_j.max(1).values
+    teacher_i = conf_i >= conf_j
+    teacher_p = torch.where(teacher_i[:, None], p_i.detach(), p_j.detach())
+    student_p = torch.where(teacher_i[:, None], p_j, p_i)
+    high_conf = torch.maximum(conf_i, conf_j)
+    valid = high_conf >= confidence_threshold
+    # Select only the most reliable fraction among gated pairs. This keeps the
+    # consistency signal sparse without introducing pseudo-label CE.
+    if active_fraction < 1.0 and valid.any():
+        scores = (similarity * high_conf).detach()
+        valid_scores = scores[valid]
+        cutoff = torch.quantile(valid_scores, 1.0 - active_fraction)
+        valid = valid & (scores >= cutoff)
+    kl = F.kl_div(student_p.clamp_min(1e-8).log(), teacher_p, reduction="none").sum(1)
+    weights = similarity * high_conf * valid.float()
+    denom = weights.sum()
+    if denom.item() == 0:
+        return logits_i.sum() * 0.0, 0.0, 0.0
+    agreement = (p_i.argmax(1) == p_j.argmax(1)).float()
+    return (weights * kl).sum() / denom, float(valid.float().mean()), float(agreement.mean())
+
+
+def load_cubes(use_ilda):
+    source, source_gt = utils.load_data_houston(
+        str(ROOT / "datasets/Houston/Houston13.mat"),
+        str(ROOT / "datasets/Houston/Houston13_7gt.mat"),
+    )
+    # Target imagery only. Houston18 GT is deliberately not opened in training.
+    target = hdf5storage.loadmat(str(ROOT / "datasets/Houston/Houston18.mat"))["ori_data"]
+    if use_ilda:
+        from UtilsCMS import ILDA
+        source, target = ILDA(source, target, 2, 0.009)
+    return source.astype(np.float32), source_gt, target.astype(np.float32)
 
 
 def train_one(args):
     set_seed(args.optimization_seed)
     device = torch.device(args.device)
-    source, source_gt = utils.load_data_houston(
-        str(ROOT / "datasets/Houston/Houston13.mat"),
-        str(ROOT / "datasets/Houston/Houston13_7gt.mat"),
-    )
-    # Only target imagery is opened during training. Target GT is post-hoc only.
-    target = hdf5storage.loadmat(str(ROOT / "datasets/Houston/Houston18.mat"))["ori_data"]
-    adapted_source, adapted_target = ILDA(source, target, 2, 0.009)
-    train_centers, train_x, _, train_y, _, val_x, _, val_y = paired_source_samples(
-        adapted_source, adapted_source, source_gt, args.split_seed
-    )
+    use_ilda = args.group in ("C", "D")
+    use_scene_shift = args.group in ("B", "D")
+    source, source_gt, target = load_cubes(use_ilda)
+    train_centers, train_y, val_centers, val_y = source_split(source_gt, args.split_seed)
+    train_x = center_patches(source, train_centers)
+    val_x = center_patches(source, val_centers)
 
-    source_flat = adapted_source.reshape(-1, adapted_source.shape[-1])
-    target_flat = adapted_target.reshape(-1, adapted_target.shape[-1])
+    source_flat = source.reshape(-1, source.shape[-1])
+    target_flat = target.reshape(-1, target.shape[-1])
     source_mean, source_std = source_flat.mean(0), source_flat.std(0)
     target_mean, target_std = target_flat.mean(0), target_flat.std(0)
-    target_centers = _full_image_centers(adapted_target.shape[:2])
-    target_x = center_patches(adapted_target, target_centers, 7)
+    band_score = band_alpha = None
+    if use_scene_shift and args.shift_mode == "band_adaptive":
+        band_score, band_alpha = build_band_adaptive_strength(
+            source_mean, source_std, target_mean, target_std,
+            alpha_min=args.alpha_min, alpha_max=args.alpha_max,
+        )
+        print(json.dumps({
+            "band_score": band_score.tolist(),
+            "band_alpha": band_alpha.tolist(),
+            "band_alpha_min": float(band_alpha.min()),
+            "band_alpha_max": float(band_alpha.max()),
+            "band_alpha_mean": float(band_alpha.mean()),
+        }), flush=True)
+    modes = mode_signatures = None
+    if use_scene_shift and args.shift_mode == "conditional":
+        modes, mode_signatures = build_target_modes(target, n_modes=args.num_modes, seed=args.optimization_seed)
+    target_x = target_neighbors = target_similarity = None
+    if args.use_target_neighborhood:
+        target_x = center_patches(
+            target,
+            np.stack(np.meshgrid(np.arange(target.shape[0]), np.arange(target.shape[1]), indexing="ij"), -1).reshape(-1, 2),
+        )
+        target_neighbors, target_similarity = build_target_neighbors(
+            target, radius=args.neighbor_radius, top_k=args.neighbor_top_k,
+            threshold=args.neighbor_similarity_threshold,
+        )
+        valid_pair_count = int((target_neighbors >= 0).sum())
+        print(json.dumps({"target_neighbor_pairs": valid_pair_count,
+                          "target_neighbor_pair_ratio": valid_pair_count / target_neighbors.size,
+                          "target_neighbor_nodes": int(target_neighbors.shape[0])}), flush=True)
 
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)),
@@ -230,28 +311,9 @@ def train_one(args):
     val_loader = DataLoader(
         TensorDataset(torch.from_numpy(val_x), torch.from_numpy(val_y)),
         batch_size=args.batch_size,
+        shuffle=False,
     )
-
-    teacher_class_centers = None
-    teacher_checkpoint = None
-    if args.foundation_reliability:
-        target_teacher_features, class_centers, teacher_checkpoint = load_foundation_cache(
-            args.foundation_cache, train_centers, train_y, target_centers
-        )
-        teacher_class_centers = torch.from_numpy(class_centers).to(device)
-        target_dataset = TensorDataset(
-            torch.from_numpy(target_x), torch.from_numpy(target_teacher_features)
-        )
-    else:
-        target_dataset = torch.from_numpy(target_x)
-    target_loader = DataLoader(
-        target_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    model = SemanticSceneUDA().to(device)
+    model = DCRNClassifier().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     cross_entropy = nn.CrossEntropyLoss()
     history = []
@@ -259,115 +321,116 @@ def train_one(args):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        target_iterator = iter(target_loader)
-        sums = {
-            key: 0.0 for key in (
-                "total", "classification", "target", "reliability",
-                "reliable_fraction", "student_agreement", "foundation_agreement",
-                "foundation_confidence",
-            )
-        }
-        correct = total_samples = 0
-        for source_x, source_y in train_loader:
-            try:
-                target_batch = next(target_iterator)
-            except StopIteration:
-                target_iterator = iter(target_loader)
-                target_batch = next(target_iterator)
-
-            if args.foundation_reliability:
-                target_x_batch, teacher_features = target_batch
-                teacher_features = teacher_features.to(device)
-            else:
-                target_x_batch = target_batch
-                teacher_features = None
-            source_x = source_x.to(device)
-            source_y = source_y.to(device)
-            target_x_batch = target_x_batch.to(device)
-            shifted_source = shift_view(
-                source_x, source_mean, source_std, target_mean, target_std
-            )
-
-            source_logits = model(augment(source_x))[3]
-            shifted_logits = model(augment(shifted_source))[3]
-            # Preserve the established weak/raw and strong/two-pass flip views.
-            strong_target_logits = model(augment(augment(target_x_batch)))[3]
-            weak_target_logits = model(target_x_batch)[3]
-
-            classification_loss = cross_entropy(source_logits, source_y)
-            if args.scene_shift:
-                classification_loss = classification_loss + 0.5 * cross_entropy(
-                    shifted_logits, source_y
-                )
-
-            target_loss = torch.zeros((), device=device)
-            reliability_stats = {
-                key: torch.zeros((), device=device) for key in (
-                    "reliability", "reliable_fraction", "student_agreement",
-                    "foundation_agreement", "foundation_confidence",
-                )
-            }
-            if args.foundation_reliability:
-                target_loss, reliability_stats = foundation_weighted_consistency(
-                    weak_target_logits,
-                    strong_target_logits,
-                    teacher_features,
-                    teacher_class_centers,
-                    args.tau_h,
-                )
-
-            loss = classification_loss + args.lambda_target * target_loss
+        loss_sum = correct = seen = 0
+        nbr_loss_sum = nbr_valid_sum = nbr_agreement_sum = nbr_seen = 0.0
+        neighborhood_active = args.use_target_neighborhood and (
+            epoch > args.neighborhood_warmup_epochs
+        )
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(augment(x))
+            loss = cross_entropy(logits, y)
+            if use_scene_shift:
+                if args.shift_mode == "conditional":
+                    shifted = conditional_scene_shift(x, source_mean, source_std, modes, mode_signatures)
+                elif args.shift_mode == "band_adaptive":
+                    shifted = band_adaptive_scene_shift(
+                        x, source_mean, source_std, target_mean, target_std, band_alpha
+                    )
+                else:
+                    shifted = scene_shift(x, source_mean, source_std, target_mean, target_std)
+                loss = loss + 0.5 * cross_entropy(model(augment(shifted)), y)
+            if neighborhood_active:
+                centers = torch.randint(0, len(target_x), (len(y),))
+                slots = torch.randint(0, target_neighbors.shape[1], (len(y),))
+                nids = target_neighbors[centers.numpy(), slots.numpy()]
+                valid = nids >= 0
+                if valid.any():
+                    centers_v = centers[valid]
+                    neigh_v = torch.from_numpy(nids[valid])
+                    sim_v = torch.from_numpy(target_similarity[centers.numpy()[valid], slots.numpy()[valid]])
+                    target_center = torch.from_numpy(target_x[centers_v.numpy()]).to(device)
+                    target_neighbor = torch.from_numpy(target_x[neigh_v.numpy()]).to(device)
+                    nbr_loss, valid_ratio, agreement = neighborhood_consistency(
+                        model, target_center, target_neighbor, sim_v.to(device),
+                        confidence_threshold=args.neighbor_confidence_threshold,
+                        active_fraction=args.neighbor_active_fraction,
+                    )
+                    loss = loss + args.lambda_nbr * nbr_loss
+                    nbr_loss_sum += float(nbr_loss.detach()) * len(centers_v)
+                    nbr_valid_sum += valid_ratio * len(centers_v)
+                    nbr_agreement_sum += agreement * len(centers_v)
+                    nbr_seen += len(centers_v)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-            batch_size = len(source_y)
-            total_samples += batch_size
-            correct += (source_logits.argmax(1) == source_y).sum().item()
-            sums["total"] += loss.item() * batch_size
-            sums["classification"] += classification_loss.item() * batch_size
-            sums["target"] += target_loss.item() * batch_size
-            for key, value in reliability_stats.items():
-                sums[key] += value.item() * batch_size
+            loss_sum += loss.item() * len(y)
+            correct += (logits.argmax(1) == y).sum().item()
+            seen += len(y)
 
         model.eval()
-        val_correct = val_samples = 0
-        val_loss_sum = 0.0
+        val_loss = val_correct = val_seen = 0
         with torch.no_grad():
-            for val_batch, labels in val_loader:
-                logits = model(val_batch.to(device))[3]
-                labels = labels.to(device)
-                val_loss_sum += cross_entropy(logits, labels).item() * len(labels)
-                val_correct += (logits.argmax(1) == labels).sum().item()
-                val_samples += len(labels)
-
+            for x, y in val_loader:
+                logits = model(x.to(device))
+                y = y.to(device)
+                val_loss += cross_entropy(logits, y).item() * len(y)
+                val_correct += (logits.argmax(1) == y).sum().item()
+                val_seen += len(y)
         row = {
             "epoch": epoch,
-            "train_loss": sums["total"] / total_samples,
-            "loss_cls": sums["classification"] / total_samples,
-            "loss_target": sums["target"] / total_samples,
-            "reliability_mean": sums["reliability"] / total_samples,
-            "reliable_fraction": sums["reliable_fraction"] / total_samples,
-            "student_agreement": sums["student_agreement"] / total_samples,
-            "foundation_agreement": sums["foundation_agreement"] / total_samples,
-            "foundation_confidence": sums["foundation_confidence"] / total_samples,
-            "train_acc": correct / total_samples,
-            "val_loss": val_loss_sum / val_samples,
-            "val_acc": val_correct / val_samples,
+            "train_loss": loss_sum / seen,
+            "train_acc": correct / seen,
+            "val_loss": val_loss / val_seen,
+            "val_acc": val_correct / val_seen,
         }
+        if neighborhood_active:
+            row.update({
+                "neighbor_loss": nbr_loss_sum / max(nbr_seen, 1),
+                "neighbor_effective_pair_ratio": nbr_valid_sum / max(nbr_seen, 1),
+                "neighbor_prediction_agreement": nbr_agreement_sum / max(nbr_seen, 1),
+            })
         history.append(row)
         print(json.dumps(row), flush=True)
-        if row["val_acc"] > best["val_acc"]:
+        if epoch >= args.checkpoint_selection_start_epoch and row["val_acc"] > best["val_acc"]:
             best = row.copy()
             torch.save(
                 {
                     "model": model.state_dict(),
+                    "group": args.group,
+                    "group_description": GROUP_DESCRIPTIONS[args.group],
                     "split_seed": args.split_seed,
                     "optimization_seed": args.optimization_seed,
-                    "config": vars(args),
+                    "use_ilda": use_ilda,
+                    "use_scene_shift": use_scene_shift,
+                    "shift_mode": args.shift_mode,
+                    "num_modes": args.num_modes,
+                    "alpha_min": args.alpha_min,
+                    "alpha_max": args.alpha_max,
+                    "band_score": None if band_score is None else band_score.tolist(),
+                    "band_alpha": None if band_alpha is None else band_alpha.tolist(),
+                    "use_target_neighborhood": args.use_target_neighborhood,
+                    "lambda_nbr": args.lambda_nbr,
+                    "neighbor_radius": args.neighbor_radius,
+                    "neighbor_top_k": args.neighbor_top_k,
+                    "neighbor_similarity_threshold": args.neighbor_similarity_threshold,
+                    "neighbor_confidence_threshold": args.neighbor_confidence_threshold,
+                    "neighbor_active_fraction": args.neighbor_active_fraction,
+                    "neighborhood_warmup_epochs": args.neighborhood_warmup_epochs,
+                    "preprocessing": {
+                        "source_target_ilda": use_ilda,
+                        "patch_width": 7,
+                        "data_range": "native Houston ori_data / ILDA output",
+                    },
+                    "backbone": {
+                        "name": "DCRN_02",
+                        "call": "DCRN_02(x, x)",
+                        "cross_attention_source_target_interaction": False,
+                    },
+                    "disabled_losses": [
+                        "foundation", "LMMD", "SCL", "prototype", "semantic", "orth", "modulation"
+                    ],
                     "best": best,
-                    "teacher_checkpoint": teacher_checkpoint,
-                    "teacher_centers_updated": False,
                     "target_gt_used_for_training_or_selection": False,
                 },
                 args.output / "best.pth",
@@ -377,36 +440,60 @@ def train_one(args):
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    config.update({
+        "group_description": GROUP_DESCRIPTIONS[args.group],
+        "use_ilda": use_ilda,
+        "use_scene_shift": use_scene_shift,
+        "shift_mode": args.shift_mode,
+        "num_modes": args.num_modes,
+        "alpha_min": args.alpha_min,
+        "alpha_max": args.alpha_max,
+        "band_score": None if band_score is None else band_score.tolist(),
+        "band_alpha": None if band_alpha is None else band_alpha.tolist(),
+        "use_target_neighborhood": args.use_target_neighborhood,
+        "lambda_nbr": args.lambda_nbr,
+        "neighbor_radius": args.neighbor_radius,
+        "neighbor_top_k": args.neighbor_top_k,
+        "neighbor_similarity_threshold": args.neighbor_similarity_threshold,
+        "neighbor_confidence_threshold": args.neighbor_confidence_threshold,
+        "neighbor_active_fraction": args.neighbor_active_fraction,
+        "neighborhood_warmup_epochs": args.neighborhood_warmup_epochs,
+        "backbone": "DCRN_02(x, x)",
+        "cross_attention_source_target_interaction": False,
+        "target_gt_used_for_training_or_selection": False,
+    })
     (args.output / "history.json").write_text(json.dumps(history, indent=2))
     (args.output / "summary.json").write_text(json.dumps({
         "config": config,
         "best": best,
-        "teacher_checkpoint": teacher_checkpoint,
-        "teacher_centers_updated": False,
         "target_gt_used_for_training_or_selection": False,
     }, indent=2))
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--stage",
-        choices=("baseline", "scene_shift", "scene_shift_foundation_reliability"),
-        default="scene_shift",
-    )
-    parser.add_argument("--split-seed", type=int, required=True)
+    parser.add_argument("--group", choices=GROUPS, required=True)
+    parser.add_argument("--split-seed", type=int, choices=SPLITS, required=True)
     parser.add_argument("--optimization-seed", type=int, default=1174)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--lambda-target", type=float, default=0.1)
-    parser.add_argument("--tau-h", type=float, default=0.1)
-    parser.add_argument("--foundation-cache", type=Path, default=FOUNDATION_CACHE)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--shift-mode", choices=("global", "conditional", "band_adaptive"), default="global")
+    parser.add_argument("--num-modes", type=int, default=4)
+    parser.add_argument("--alpha-min", type=float, default=0.4)
+    parser.add_argument("--alpha-max", type=float, default=0.8)
+    parser.add_argument("--use-target-neighborhood", action="store_true")
+    parser.add_argument("--lambda-nbr", type=float, default=0.05)
+    parser.add_argument("--neighbor-radius", type=int, default=2)
+    parser.add_argument("--neighbor-top-k", type=int, default=4)
+    parser.add_argument("--neighbor-similarity-threshold", type=float, default=0.85)
+    parser.add_argument("--neighbor-confidence-threshold", type=float, default=0.7)
+    parser.add_argument("--neighbor-active-fraction", type=float, default=1.0)
+    parser.add_argument("--neighborhood-warmup-epochs", type=int, default=0)
+    parser.add_argument("--checkpoint-selection-start-epoch", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    args.scene_shift = args.stage != "baseline"
-    args.foundation_reliability = args.stage == "scene_shift_foundation_reliability"
     args.output.mkdir(parents=True, exist_ok=True)
     return args
 

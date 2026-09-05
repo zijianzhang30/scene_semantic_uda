@@ -1,30 +1,40 @@
-"""Student classifier using MLUDA's DCRN_02 extractor."""
+"""DCRN-only classifier used by the clean four-group audit.
+
+DCRN_02 exposes two inputs because the original MLUDA model used a paired
+source/target path. Its internal CrossAttention is therefore executed here as
+``DCRN_02(x, x)``: both inputs are the same sample, so no source-target batch
+interaction or adaptation is introduced. All four audit groups use this exact
+backbone call.
+"""
 from pathlib import Path
 import sys
-import torch
+
 import torch.nn as nn
 
-LEGACY_ROOT = Path('/home/zhangzj26/TGRS_MLUDA-2024')
+LEGACY_ROOT = Path("/home/zhangzj26/TGRS_MLUDA-2024")
 sys.path.insert(0, str(LEGACY_ROOT))
 from net2 import DCRN_02
 
 
-class SemanticSceneUDA(nn.Module):
-    """Checkpoint-compatible student used by the validated Scene Shift runs.
+class DCRNClassifier(nn.Module):
+    """DCRN_02 feature extractor plus a single supervised CE classifier."""
 
-    Input: [B, 48, 7, 7]. Output h=[B,288], z_sem=[B,128],
-    z_scene=[B,64], logits=[B,7]. The dormant scene head remains only to keep
-    existing baseline/Scene Shift checkpoints strictly loadable.
-    """
-    def __init__(self, bands=48, classes=7):
+    backbone_call = "DCRN_02(x, x)"
+    cross_attention_source_target_interaction = False
+
+    def __init__(self, bands=48, patch_size=7, classes=7):
         super().__init__()
-        self.extractor = DCRN_02(bands, 7, classes)
-        self.semantic_head = nn.Sequential(nn.Linear(288, 128), nn.LayerNorm(128), nn.GELU())
-        self.scene_head = nn.Sequential(nn.Linear(288, 64), nn.LayerNorm(64), nn.GELU())
-        self.classifier = nn.Linear(128, classes)
+        self.backbone = DCRN_02(bands, patch_size, classes)
+        self.classifier = nn.Linear(288, classes)
+
+    def forward_features(self, x):
+        features, _same_input_features = self.backbone(x, x)
+        return features
 
     def forward(self, x):
-        h, _ = self.extractor(x, x)
-        z_sem = self.semantic_head(h)
-        z_scene = self.scene_head(h)
-        return h, z_sem, z_scene, self.classifier(z_sem)
+        return self.classifier(self.forward_features(x))
+
+
+# Keep the old import name available to legacy evaluators; the clean audit does
+# not use the previous semantic/scene heads or their losses.
+SemanticSceneUDA = DCRNClassifier
