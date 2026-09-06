@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT), str(HERE)]
 from config_Houston import HalfWidth  # noqa: E402
 from mamba_model import MambaBackboneClassifier  # noqa: E402
+from own_backbone import SpectralSpatialGatedMambaClassifier  # noqa: E402
 _spec = importlib.util.spec_from_file_location("hsi_utils", ROOT / "utils.py")
 utils = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(utils)
 
@@ -73,9 +74,9 @@ def train_one(args):
     sm, ss, tm, ts = sf.mean(0), sf.std(0), tf.mean(0), tf.std(0)
     train_loader=DataLoader(TensorDataset(torch.from_numpy(train_x),torch.from_numpy(ty)),batch_size=args.batch_size,shuffle=True,drop_last=True)
     val_loader=DataLoader(TensorDataset(torch.from_numpy(val_x),torch.from_numpy(vy)),batch_size=args.batch_size,shuffle=False)
-    model=MambaBackboneClassifier().to(device)
+    model=(SpectralSpatialGatedMambaClassifier() if args.model_type == "own" else MambaBackboneClassifier()).to(device)
     if args.optimizer == "sgd":
-        if args.official_recipe:
+        if args.official_recipe and args.model_type != "own":
             # DAMamba's scheduler applies args.lr as the first multiplier.  Its
             # parameter groups therefore start at 0.1/1.0 and become
             # 0.1*args.lr/args.lr after the first scheduler step.
@@ -83,7 +84,10 @@ def train_one(args):
                     {"params": list(model.bottleneck.parameters()) + list(model.classifier.parameters()), "lr": 1.0}]
             opt=torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
         else:
-            opt=torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+            # For the own backbone use one uniform group.  Keep the official
+            # scheduler parameterization (lambda(0)=args.lr), hence initialize
+            # the group at 1.0 so its effective first rate is args.lr.
+            opt=torch.optim.SGD(model.parameters(), lr=(1.0 if args.official_recipe else args.lr), momentum=0.9, weight_decay=5e-4)
         if args.lr_scheduler:
             scheduler=torch.optim.lr_scheduler.LambdaLR(
                 opt, lambda step: (args.lr if args.official_recipe else 1.0)
@@ -111,12 +115,13 @@ def train_one(args):
                 z=model(x.to(device)); yt=y.to(device); vl+=ce(z,yt).item()*len(y); vcnt+=(z.argmax(1)==yt).sum().item(); vs+=len(y)
             probe = next(iter(val_loader))[0][:min(32, args.batch_size)].to(device)
             feature_norm=float(model.forward_features(probe).norm(dim=1).mean())
-        cls_norm=float(torch.sqrt(sum(p.detach().norm()**2 for p in model.classifier.parameters())))
+        cls_module = model.head if args.model_type == "own" else model.classifier
+        cls_norm=float(torch.sqrt(sum(p.detach().norm()**2 for p in cls_module.parameters())))
         row={"epoch":epoch,"train_loss":loss_sum/seen,"train_acc":correct/seen,"val_loss":vl/vs,"val_acc":vcnt/vs,"lr":opt.param_groups[0]["lr"],"feature_norm":feature_norm,"classifier_weight_norm":cls_norm,"gradient_norm":grad_norm}; history.append(row); print(json.dumps(row),flush=True)
         if row["val_acc"]>best["val_acc"]:
-            best=row.copy(); torch.save({"model":model.state_dict(),"model_type":"mamba","patch_size":12,"backbone":"DAMamba MambaFeature","backbone_output_dim":4608,"bottleneck_width":256,"split_seed":args.split_seed,"optimization_seed":args.optimization_seed,"use_scene_shift":args.use_scene_shift,"target_gt_used_for_training_or_selection":False,"disabled_losses":["prototype","pseudo_label","LMMD","FixMatch","intra","inter","foundation","semantic","neighborhood","modulation"] ,"best":best},args.output/"best.pth")
-    cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; cfg.update({"model_type":"mamba","patch_size":12,"backbone_output_dim":4608,"feature_refinement":"official ChannelAttention + SpatialAttention + adaptive pooling","target_gt_used_for_training_or_selection":False}); (args.output/"history.json").write_text(json.dumps(history,indent=2)); (args.output/"summary.json").write_text(json.dumps({"config":cfg,"best":best},indent=2))
+            best=row.copy(); torch.save({"model":model.state_dict(),"model_type":args.model_type,"patch_size":12,"backbone":"SpectralSpatialGatedMamba" if args.model_type == "own" else "DAMamba MambaFeature","backbone_output_dim":getattr(model,"representation_dim",4608),"split_seed":args.split_seed,"optimization_seed":args.optimization_seed,"use_scene_shift":args.use_scene_shift,"target_gt_used_for_training_or_selection":False,"disabled_losses":["prototype","pseudo_label","LMMD","FixMatch","intra","inter","foundation","semantic","neighborhood","modulation"] ,"best":best},args.output/"best.pth")
+    cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; cfg.update({"model_type":args.model_type,"patch_size":12,"backbone_output_dim":getattr(model,"representation_dim",4608),"target_gt_used_for_training_or_selection":False}); (args.output/"history.json").write_text(json.dumps(history,indent=2)); (args.output/"summary.json").write_text(json.dumps({"config":cfg,"best":best},indent=2))
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--split-seed",type=int,choices=SPLITS,required=True); p.add_argument("--optimization-seed",type=int,default=1174); p.add_argument("--epochs",type=int,default=100); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--lr",type=float,default=0.001); p.add_argument("--optimizer",choices=("sgd","adamw"),default="sgd"); p.add_argument("--official-recipe",action="store_true"); p.add_argument("--lr-scheduler",action="store_true"); p.add_argument("--lr-gamma",type=float,default=0.0003); p.add_argument("--lr-decay",type=float,default=0.75); p.add_argument("--device",default="cuda:0"); p.add_argument("--use-scene-shift",action="store_true"); p.add_argument("--output",type=Path,required=True); a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
+    p=argparse.ArgumentParser(); p.add_argument("--split-seed",type=int,choices=SPLITS,required=True); p.add_argument("--optimization-seed",type=int,default=1174); p.add_argument("--epochs",type=int,default=100); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--lr",type=float,default=0.001); p.add_argument("--optimizer",choices=("sgd","adamw"),default="sgd"); p.add_argument("--official-recipe",action="store_true"); p.add_argument("--lr-scheduler",action="store_true"); p.add_argument("--lr-gamma",type=float,default=0.0003); p.add_argument("--lr-decay",type=float,default=0.75); p.add_argument("--device",default="cuda:0"); p.add_argument("--use-scene-shift",action="store_true"); p.add_argument("--model-type",choices=("mamba","own"),default="mamba"); p.add_argument("--output",type=Path,required=True); a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
 if __name__=="__main__": main()

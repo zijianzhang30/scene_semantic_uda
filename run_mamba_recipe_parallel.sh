@@ -3,6 +3,7 @@ set -euo pipefail
 
 epochs=${1:?epochs required}
 output_root=${2:?output root required}
+model_type=${3:-mamba}
 root=/home/zhangzj26/scene_semantic_uda
 python=/home/zhangzj26/TGRS_MLUDA-2024/.venv/bin/python
 mkdir -p "$output_root/logs"
@@ -17,7 +18,7 @@ launch() {
     fi
     CUDA_VISIBLE_DEVICES="$gpu" "$python" -u "$root/train_mamba.py" \
         --split-seed "$split" --optimization-seed 1174 --epochs "$epochs" \
-        --batch-size 8 --optimizer sgd --official-recipe --lr-scheduler --lr 0.01 \
+        --batch-size 8 --optimizer sgd --official-recipe --lr-scheduler --lr 0.01 --model-type "$model_type" \
         --device cuda:0 --output "$output" "${shift[@]}" \
         > "$output_root/logs/${method}_${split}.log" 2>&1 &
 }
