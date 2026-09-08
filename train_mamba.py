@@ -1,6 +1,6 @@
 """Clean DAMamba-style Mamba backbone audit (no UDA adaptation losses)."""
 from __future__ import annotations
-import argparse, json, random, sys, importlib.util
+import argparse, json, random, sys, importlib.util, time
 from pathlib import Path
 import hdf5storage
 import numpy as np
@@ -14,7 +14,13 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(ROOT), str(HERE)]
 from config_Houston import HalfWidth  # noqa: E402
 from mamba_model import MambaBackboneClassifier  # noqa: E402
-from own_backbone import SpectralSpatialGatedMambaClassifier, SpectralPillarsClassifier  # noqa: E402
+from own_backbone import (  # noqa: E402
+    DistributionalSpectralPillarsClassifier,
+    JointSpectralSpatialMambaClassifier,
+    SceneRobustJointSpectralSpatialMambaClassifier,
+    SpectralPillarsClassifier,
+    SpectralSpatialGatedMambaClassifier,
+)
 _spec = importlib.util.spec_from_file_location("hsi_utils", ROOT / "utils.py")
 utils = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(utils)
 
@@ -75,7 +81,10 @@ def train_one(args):
     train_loader=DataLoader(TensorDataset(torch.from_numpy(train_x),torch.from_numpy(ty)),batch_size=args.batch_size,shuffle=True,drop_last=True)
     val_loader=DataLoader(TensorDataset(torch.from_numpy(val_x),torch.from_numpy(vy)),batch_size=args.batch_size,shuffle=False)
     model=({"own": SpectralSpatialGatedMambaClassifier,
-            "pillars": SpectralPillarsClassifier}.get(args.model_type, MambaBackboneClassifier)()).to(device)
+            "pillars": SpectralPillarsClassifier,
+            "distributional_pillars": DistributionalSpectralPillarsClassifier,
+            "joint_mamba": JointSpectralSpatialMambaClassifier,
+            "joint_mamba_medium": SceneRobustJointSpectralSpatialMambaClassifier}.get(args.model_type, MambaBackboneClassifier)()).to(device)
     if args.optimizer == "sgd":
         if args.official_recipe and args.model_type == "mamba":
             # DAMamba's scheduler applies args.lr as the first multiplier.  Its
@@ -99,12 +108,28 @@ def train_one(args):
     else:
         opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4); scheduler=None
     ce=nn.CrossEntropyLoss(); best={"val_acc":-1.0}; history=[]
+    if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(1,args.epochs+1):
+        if device.type == "cuda": torch.cuda.synchronize(device)
+        epoch_start=time.perf_counter()
         model.train(); loss_sum=correct=seen=0
         grad_norm=0.0
         for x,y in train_loader:
-            x,y=x.to(device),y.to(device); logits=model(augment(x)); loss=ce(logits,y)
-            if args.use_scene_shift: loss=loss+0.5*ce(model(augment(scene_shift(x,sm,ss,tm,ts))),y)
+            x,y=x.to(device),y.to(device)
+            original=augment(x)
+            if args.use_scene_shift and args.concat_scene_views:
+                # Optional fast path.  It is benchmarked separately because
+                # selective-scan peak memory grows with the flattened
+                # B*H*W pillar batch and may outweigh launch savings.
+                shifted=augment(scene_shift(x,sm,ss,tm,ts))
+                logits_all=model(torch.cat((original, shifted), dim=0))
+                logits, shifted_logits=logits_all.chunk(2, dim=0)
+                loss=ce(logits,y)+0.5*ce(shifted_logits,y)
+            elif args.use_scene_shift:
+                logits=model(original)
+                loss=ce(logits,y)+0.5*ce(model(augment(scene_shift(x,sm,ss,tm,ts))),y)
+            else:
+                logits=model(original); loss=ce(logits,y)
             opt.zero_grad(); loss.backward()
             grad_norm = float(torch.sqrt(sum((p.grad.detach()**2).sum() for p in model.parameters() if p.grad is not None)))
             opt.step()
@@ -116,14 +141,20 @@ def train_one(args):
                 z=model(x.to(device)); yt=y.to(device); vl+=ce(z,yt).item()*len(y); vcnt+=(z.argmax(1)==yt).sum().item(); vs+=len(y)
             probe = next(iter(val_loader))[0][:min(32, args.batch_size)].to(device)
             feature_norm=float(model.forward_features(probe).norm(dim=1).mean())
-        cls_module = model.head if args.model_type in ("own", "pillars") else model.classifier
+            latent_stats=(model.distribution_stats(probe)
+                          if args.model_type == "distributional_pillars" else {})
+        cls_module = model.head if args.model_type in ("own", "pillars", "distributional_pillars", "joint_mamba", "joint_mamba_medium") else model.classifier
         cls_norm=float(torch.sqrt(sum(p.detach().norm()**2 for p in cls_module.parameters())))
-        row={"epoch":epoch,"train_loss":loss_sum/seen,"train_acc":correct/seen,"val_loss":vl/vs,"val_acc":vcnt/vs,"lr":opt.param_groups[0]["lr"],"feature_norm":feature_norm,"classifier_weight_norm":cls_norm,"gradient_norm":grad_norm}; history.append(row); print(json.dumps(row),flush=True)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            peak_gpu_memory_mb=torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+        else: peak_gpu_memory_mb=0.0
+        row={"epoch":epoch,"train_loss":loss_sum/seen,"train_acc":correct/seen,"val_loss":vl/vs,"val_acc":vcnt/vs,"lr":opt.param_groups[0]["lr"],"feature_norm":feature_norm,"classifier_weight_norm":cls_norm,"gradient_norm":grad_norm,"epoch_seconds":time.perf_counter()-epoch_start,"peak_gpu_memory_mb":peak_gpu_memory_mb,**latent_stats}; history.append(row); print(json.dumps(row),flush=True)
         if row["val_acc"]>best["val_acc"]:
-            backbone_name={"own":"SpectralSpatialGatedMamba", "pillars":"SpectralPillars"}.get(args.model_type,"DAMamba MambaFeature")
+            backbone_name={"own":"SpectralSpatialGatedMamba", "pillars":"SpectralPillars", "distributional_pillars":"DistributionalSpectralPillars(K=8)", "joint_mamba":"JointSpectralSpatialMamba", "joint_mamba_medium":"SceneRobustJointSpectralSpatialMamba"}.get(args.model_type,"DAMamba MambaFeature")
             best=row.copy(); torch.save({"model":model.state_dict(),"model_type":args.model_type,"patch_size":12,"backbone":backbone_name,"backbone_output_dim":getattr(model,"representation_dim",4608),"split_seed":args.split_seed,"optimization_seed":args.optimization_seed,"use_scene_shift":args.use_scene_shift,"target_gt_used_for_training_or_selection":False,"disabled_losses":["prototype","pseudo_label","LMMD","FixMatch","intra","inter","foundation","semantic","neighborhood","modulation"] ,"best":best},args.output/"best.pth")
     cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; cfg.update({"model_type":args.model_type,"patch_size":12,"backbone_output_dim":getattr(model,"representation_dim",4608),"target_gt_used_for_training_or_selection":False}); (args.output/"history.json").write_text(json.dumps(history,indent=2)); (args.output/"summary.json").write_text(json.dumps({"config":cfg,"best":best},indent=2))
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--split-seed",type=int,choices=SPLITS,required=True); p.add_argument("--optimization-seed",type=int,default=1174); p.add_argument("--epochs",type=int,default=100); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--lr",type=float,default=0.001); p.add_argument("--optimizer",choices=("sgd","adamw"),default="sgd"); p.add_argument("--official-recipe",action="store_true"); p.add_argument("--lr-scheduler",action="store_true"); p.add_argument("--lr-gamma",type=float,default=0.0003); p.add_argument("--lr-decay",type=float,default=0.75); p.add_argument("--device",default="cuda:0"); p.add_argument("--use-scene-shift",action="store_true"); p.add_argument("--model-type",choices=("mamba","own","pillars"),default="mamba"); p.add_argument("--output",type=Path,required=True); a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
+    p=argparse.ArgumentParser(); p.add_argument("--split-seed",type=int,choices=SPLITS,required=True); p.add_argument("--optimization-seed",type=int,default=1174); p.add_argument("--epochs",type=int,default=100); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--lr",type=float,default=0.001); p.add_argument("--optimizer",choices=("sgd","adamw"),default="sgd"); p.add_argument("--official-recipe",action="store_true"); p.add_argument("--lr-scheduler",action="store_true"); p.add_argument("--lr-gamma",type=float,default=0.0003); p.add_argument("--lr-decay",type=float,default=0.75); p.add_argument("--device",default="cuda:0"); p.add_argument("--use-scene-shift",action="store_true"); p.add_argument("--concat-scene-views",action="store_true"); p.add_argument("--model-type",choices=("mamba","own","pillars","distributional_pillars","joint_mamba","joint_mamba_medium"),default="mamba"); p.add_argument("--output",type=Path,required=True); a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
 if __name__=="__main__": main()
