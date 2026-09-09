@@ -338,7 +338,10 @@ def train_one(args):
                         x, source_mean, source_std, target_mean, target_std, band_alpha
                     )
                 else:
-                    shifted = scene_shift(x, source_mean, source_std, target_mean, target_std)
+                    shifted = scene_shift(
+                        x, source_mean, source_std, target_mean, target_std,
+                        strength=args.scene_shift_strength,
+                    )
                 loss = loss + 0.5 * cross_entropy(model(augment(shifted)), y)
             if neighborhood_active:
                 centers = torch.randint(0, len(target_x), (len(y),))
@@ -404,6 +407,7 @@ def train_one(args):
                     "use_ilda": use_ilda,
                     "use_scene_shift": use_scene_shift,
                     "shift_mode": args.shift_mode,
+                    "scene_shift_strength": args.scene_shift_strength,
                     "num_modes": args.num_modes,
                     "alpha_min": args.alpha_min,
                     "alpha_max": args.alpha_max,
@@ -445,6 +449,7 @@ def train_one(args):
         "use_ilda": use_ilda,
         "use_scene_shift": use_scene_shift,
         "shift_mode": args.shift_mode,
+        "scene_shift_strength": args.scene_shift_strength,
         "num_modes": args.num_modes,
         "alpha_min": args.alpha_min,
         "alpha_max": args.alpha_max,
@@ -480,6 +485,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--shift-mode", choices=("global", "conditional", "band_adaptive"), default="global")
+    parser.add_argument("--scene-shift-strength", type=float, default=0.7)
     parser.add_argument("--num-modes", type=int, default=4)
     parser.add_argument("--alpha-min", type=float, default=0.4)
     parser.add_argument("--alpha-max", type=float, default=0.8)
@@ -494,6 +500,8 @@ def parse_args():
     parser.add_argument("--checkpoint-selection-start-epoch", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not 0.0 <= args.scene_shift_strength <= 1.0:
+        parser.error("--scene-shift-strength must be in [0, 1]")
     args.output.mkdir(parents=True, exist_ok=True)
     return args
 

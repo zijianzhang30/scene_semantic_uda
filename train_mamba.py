@@ -69,6 +69,19 @@ def scene_shift(x, sm, ss, tm, ts, strength=0.7):
     noise = F.avg_pool2d(torch.randn_like(shifted), 5, 1, 2)
     return (shifted*scale + 0.015*noise).clamp(0,1)
 
+def parameter_update_l2(named_params, initial_params):
+    """Report how far the trained refinement weights moved from initialization."""
+    out = {}
+    for prefix in ("channel_attention", "spatial_attention"):
+        squared = 0.0
+        for name, parameter in named_params.items():
+            if name.startswith(prefix + "."):
+                delta = parameter.detach().cpu() - initial_params[name]
+                squared += float((delta * delta).sum())
+        out[prefix] = squared ** 0.5
+    out["total"] = sum(value * value for value in out.values()) ** 0.5
+    return out
+
 def train_one(args):
     set_seed(args.optimization_seed); device=torch.device(args.device)
     source, source_gt = utils.load_data_houston(str(ROOT/"datasets/Houston/Houston13.mat"), str(ROOT/"datasets/Houston/Houston13_7gt.mat"))
@@ -85,13 +98,22 @@ def train_one(args):
             "distributional_pillars": DistributionalSpectralPillarsClassifier,
             "joint_mamba": JointSpectralSpatialMambaClassifier,
             "joint_mamba_medium": SceneRobustJointSpectralSpatialMambaClassifier}.get(args.model_type, MambaBackboneClassifier)()).to(device)
+    attention_initial = {name: parameter.detach().cpu().clone()
+                         for name, parameter in model.named_parameters()
+                         if name.startswith(("channel_attention.", "spatial_attention."))}
+    if args.model_type == "mamba":
+        attention_params = list(model.channel_attention.parameters()) + list(model.spatial_attention.parameters())
+        assert attention_params and all(parameter.requires_grad for parameter in attention_params)
+    else:
+        attention_params = []
     if args.optimizer == "sgd":
         if args.official_recipe and args.model_type == "mamba":
             # DAMamba's scheduler applies args.lr as the first multiplier.  Its
             # parameter groups therefore start at 0.1/1.0 and become
             # 0.1*args.lr/args.lr after the first scheduler step.
             params=[{"params": model.backbone.parameters(), "lr": 0.1},
-                    {"params": list(model.bottleneck.parameters()) + list(model.classifier.parameters()), "lr": 1.0}]
+                    {"params": list(model.bottleneck.parameters()) + list(model.classifier.parameters()) + attention_params,
+                     "lr": 1.0}]
             opt=torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=5e-4)
         else:
             # For the own backbone use one uniform group.  Keep the official
@@ -107,6 +129,13 @@ def train_one(args):
             scheduler=None
     else:
         opt=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4); scheduler=None
+    if args.model_type == "mamba":
+        optimized_ids = {id(parameter) for group in opt.param_groups for parameter in group["params"]}
+        trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+        refinement_ids = {id(parameter) for parameter in attention_params}
+        assert optimized_ids == trainable_ids
+        if args.optimizer == "sgd" and args.official_recipe:
+            assert refinement_ids.issubset({id(parameter) for parameter in opt.param_groups[1]["params"]})
     ce=nn.CrossEntropyLoss(); best={"val_acc":-1.0}; history=[]
     if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(1,args.epochs+1):
@@ -152,8 +181,8 @@ def train_one(args):
         row={"epoch":epoch,"train_loss":loss_sum/seen,"train_acc":correct/seen,"val_loss":vl/vs,"val_acc":vcnt/vs,"lr":opt.param_groups[0]["lr"],"feature_norm":feature_norm,"classifier_weight_norm":cls_norm,"gradient_norm":grad_norm,"epoch_seconds":time.perf_counter()-epoch_start,"peak_gpu_memory_mb":peak_gpu_memory_mb,**latent_stats}; history.append(row); print(json.dumps(row),flush=True)
         if row["val_acc"]>best["val_acc"]:
             backbone_name={"own":"SpectralSpatialGatedMamba", "pillars":"SpectralPillars", "distributional_pillars":"DistributionalSpectralPillars(K=8)", "joint_mamba":"JointSpectralSpatialMamba", "joint_mamba_medium":"SceneRobustJointSpectralSpatialMamba"}.get(args.model_type,"DAMamba MambaFeature")
-            best=row.copy(); torch.save({"model":model.state_dict(),"model_type":args.model_type,"patch_size":12,"backbone":backbone_name,"backbone_output_dim":getattr(model,"representation_dim",4608),"split_seed":args.split_seed,"optimization_seed":args.optimization_seed,"use_scene_shift":args.use_scene_shift,"target_gt_used_for_training_or_selection":False,"disabled_losses":["prototype","pseudo_label","LMMD","FixMatch","intra","inter","foundation","semantic","neighborhood","modulation"] ,"best":best},args.output/"best.pth")
-    cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; cfg.update({"model_type":args.model_type,"patch_size":12,"backbone_output_dim":getattr(model,"representation_dim",4608),"target_gt_used_for_training_or_selection":False}); (args.output/"history.json").write_text(json.dumps(history,indent=2)); (args.output/"summary.json").write_text(json.dumps({"config":cfg,"best":best},indent=2))
+            best=row.copy(); attention_update_l2=parameter_update_l2(dict(model.named_parameters()), attention_initial); torch.save({"model":model.state_dict(),"model_type":args.model_type,"patch_size":12,"backbone":backbone_name,"backbone_output_dim":getattr(model,"representation_dim",4608),"split_seed":args.split_seed,"optimization_seed":args.optimization_seed,"use_scene_shift":args.use_scene_shift,"target_gt_used_for_training_or_selection":False,"attention_refinement_optimized":args.model_type == "mamba","attention_update_l2":attention_update_l2,"disabled_losses":["prototype","pseudo_label","LMMD","FixMatch","intra","inter","foundation","semantic","neighborhood","modulation"] ,"best":best},args.output/"best.pth")
+    cfg={k:(str(v) if isinstance(v,Path) else v) for k,v in vars(args).items()}; cfg.update({"model_type":args.model_type,"patch_size":12,"backbone_output_dim":getattr(model,"representation_dim",4608),"target_gt_used_for_training_or_selection":False,"attention_refinement_optimized":args.model_type == "mamba","attention_optimizer_group":"bottleneck_classifier_refinement" if args.model_type == "mamba" else None}); (args.output/"history.json").write_text(json.dumps(history,indent=2)); (args.output/"summary.json").write_text(json.dumps({"config":cfg,"best":best,"attention_update_l2":parameter_update_l2(dict(model.named_parameters()), attention_initial)},indent=2))
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--split-seed",type=int,choices=SPLITS,required=True); p.add_argument("--optimization-seed",type=int,default=1174); p.add_argument("--epochs",type=int,default=100); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--lr",type=float,default=0.001); p.add_argument("--optimizer",choices=("sgd","adamw"),default="sgd"); p.add_argument("--official-recipe",action="store_true"); p.add_argument("--lr-scheduler",action="store_true"); p.add_argument("--lr-gamma",type=float,default=0.0003); p.add_argument("--lr-decay",type=float,default=0.75); p.add_argument("--device",default="cuda:0"); p.add_argument("--use-scene-shift",action="store_true"); p.add_argument("--concat-scene-views",action="store_true"); p.add_argument("--model-type",choices=("mamba","own","pillars","distributional_pillars","joint_mamba","joint_mamba_medium"),default="mamba"); p.add_argument("--output",type=Path,required=True); a=p.parse_args(); a.output.mkdir(parents=True,exist_ok=True); train_one(a)
