@@ -34,7 +34,7 @@ def main():
         for name,r in results.items():
             for c,a in enumerate(r['per_class_accuracy'],1): w.writerow([name,c,a])
     # Distribution and per-class stats at the saved source-val-best model/discriminator.
-    discriminator=PatchDomainDiscriminator(48).to(device); discriminator.load_state_dict(ck['discriminator']); discriminator.eval(); sf,tf=source.reshape(-1,48),target.reshape(-1,48); sm,ss=sf.mean(0),sf.std(0); tm,ts=tf.mean(0),tf.std(0); tc,ty,_,_=clean.source_split(source_gt,1174); train_x=clean.center_patches(source,tc)
+    discriminator=PatchDomainDiscriminator(48).to(device); discriminator.load_state_dict(ck['discriminator_state']); discriminator.eval(); sf,tf=source.reshape(-1,48),target.reshape(-1,48); sm,ss=sf.mean(0),sf.std(0); tm,ts=tf.mean(0),tf.std(0); tc,ty,_,_=clean.source_split(source_gt,1174); train_x=clean.center_patches(source,tc)
     torch.manual_seed(20260909); shifted=[]
     with torch.no_grad():
         for i in range(0,len(train_x),256): shifted.append(clean.scene_shift(torch.from_numpy(train_x[i:i+256]).to(device),sm,ss,tm,ts,strength=0.8).cpu())
