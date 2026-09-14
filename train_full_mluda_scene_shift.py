@@ -188,6 +188,9 @@ def main():
             "mluda_source_only",
             "mluda_shift_counterpart",
             "mluda_dual_counterpart",
+            "mluda_dual_counterpart_ce025",
+            "mluda_dual_counterpart_ce05",
+            "mluda_dual_target_control",
         ),
         required=True,
     )
@@ -237,6 +240,14 @@ def main():
     target_loader = DataLoader(
         target_dataset, batch_size=BATCH_SIZE, sampler=target_sampler, drop_last=True,
     )
+    target_loader2 = None
+    if args.method == "mluda_dual_target_control":
+        target_sampler2 = RandomSampler(
+            target_dataset, replacement=False, num_samples=target_samples_per_epoch,
+        )
+        target_loader2 = DataLoader(
+            target_dataset, batch_size=BATCH_SIZE, sampler=target_sampler2, drop_last=True,
+        )
 
     source_pixels = source.reshape(-1, nBand)
     target_pixels = target.reshape(-1, nBand)
@@ -257,7 +268,8 @@ def main():
         learning_rate = lr / math.pow(1 + 10 * (epoch - 1) / args.epochs, 0.75)
         optimizer = make_optimizer(model, learning_rate)
         target_iterator = iter(target_loader)
-        sums = {name: 0.0 for name in ("total", "cls", "shift", "lmmd", "scl_source", "scl_target", "domain", "dual_adapt")}
+        target_iterator2 = iter(target_loader2) if target_loader2 is not None else None
+        sums = {name: 0.0 for name in ("total", "cls", "shift", "lmmd", "scl_source", "scl_target", "domain", "dual_adapt", "dual_shift_ce")}
         correct = count = 0
 
         for source_data, source_label in train_loader:
@@ -282,6 +294,13 @@ def main():
                     target_data = next(target_iterator)
                 target_data = target_data.to(device)
                 counterpart_data = target_data
+                if args.method == "mluda_dual_target_control":
+                    try:
+                        target_data2 = next(target_iterator2)
+                    except StopIteration:
+                        target_iterator2 = iter(target_loader2)
+                        target_data2 = next(target_iterator2)
+                    target_data2 = target_data2.to(device)
             source_noise, counterpart_noise, source_flip, counterpart_flip = official_augmentations(
                 source_data, counterpart_data, device
             )
@@ -321,14 +340,17 @@ def main():
                     + source_scl + target_scl + domain_loss
                 )
 
-                if args.method == "mluda_dual_counterpart":
+                if args.method in ("mluda_dual_counterpart", "mluda_dual_counterpart_ce025", "mluda_dual_counterpart_ce05", "mluda_dual_target_control"):
                     # Second adaptation counterpart: shifted source is treated
                     # as unlabeled. Its source labels are used only by the
                     # source side of LMMD/SCL, never as target supervision.
-                    shifted_counterpart = scene_shift(
-                        source_data, source_mean, source_std,
-                        target_mean, target_std, strength=args.scene_shift_alpha,
-                    )
+                    if args.method == "mluda_dual_target_control":
+                        shifted_counterpart = target_data2
+                    else:
+                        shifted_counterpart = scene_shift(
+                            source_data, source_mean, source_std,
+                            target_mean, target_std, strength=args.scene_shift_alpha,
+                        )
                     shift_src_noise, shift_tgt_noise, shift_src_flip, shift_tgt_flip = official_augmentations(
                         source_data, shifted_counterpart, device
                     )
@@ -353,7 +375,14 @@ def main():
                         + dual_source_scl + dual_target_scl + dual_domain
                     )
                     total_loss = total_loss + args.dual_gamma * dual_adapt
-                    sums["dual_adapt"] += float(dual_adapt.detach()) * len(source_label)
+                    shift_ce_weight = {
+                        "mluda_dual_counterpart": 0.0,
+                        "mluda_dual_counterpart_ce025": 0.25,
+                        "mluda_dual_counterpart_ce05": 0.5,
+                        "mluda_dual_target_control": 0.0,
+                    }[args.method]
+                    dual_shift_ce = ce(st_logits, source_label)
+                    total_loss = total_loss + shift_ce_weight * dual_shift_ce
 
             shift_loss = source_logits.new_zeros(())
             if args.method == "full_mluda_scene_shift":
@@ -376,7 +405,8 @@ def main():
                 ("total", total_loss), ("cls", cls_loss), ("shift", shift_loss),
                 ("lmmd", lmmd_loss), ("scl_source", source_scl),
                 ("scl_target", target_scl), ("domain", domain_loss),
-                ("dual_adapt", source_logits.new_zeros(()) if args.method != "mluda_dual_counterpart" else dual_adapt),
+                ("dual_adapt", source_logits.new_zeros(()) if args.method not in ("mluda_dual_counterpart", "mluda_dual_counterpart_ce025", "mluda_dual_counterpart_ce05", "mluda_dual_target_control") else dual_adapt),
+                ("dual_shift_ce", source_logits.new_zeros(()) if args.method not in ("mluda_dual_counterpart", "mluda_dual_counterpart_ce025", "mluda_dual_counterpart_ce05", "mluda_dual_target_control") else dual_shift_ce),
             ):
                 sums[name] += float(value.detach()) * batch_count
 
@@ -391,6 +421,8 @@ def main():
             "train_source_scl": sums["scl_source"] / count,
             "train_target_scl": sums["scl_target"] / count,
             "train_domain_loss": sums["domain"] / count,
+            "train_dual_adapt": sums["dual_adapt"] / count,
+            "train_dual_shift_ce": sums["dual_shift_ce"] / count,
             "train_acc": correct / count,
             "val_loss": val_loss,
             "val_acc": val_acc,
@@ -431,7 +463,7 @@ def main():
         "best_epoch": int(best["epoch"]),
         "source_val_accuracy": float(best["val_acc"]),
         "train_seconds": time.time() - start_time,
-        "scene_shift_alpha": args.scene_shift_alpha if args.method in ("full_mluda_scene_shift", "mluda_shift_counterpart", "mluda_dual_counterpart") else None,
+        "scene_shift_alpha": args.scene_shift_alpha if args.method in ("full_mluda_scene_shift", "mluda_shift_counterpart", "mluda_dual_counterpart", "mluda_dual_counterpart_ce025", "mluda_dual_counterpart_ce05") else None,
         "scene_shift_weight": args.scene_shift_weight if args.method == "full_mluda_scene_shift" else None,
         "adaptation_counterpart": {
             "full_mluda": "real target x_t",
@@ -439,7 +471,16 @@ def main():
             "mluda_source_only": "none (source x_s paired with itself)",
             "mluda_shift_counterpart": "unlabeled SceneShift(x_s; target stats, alpha=0.8)",
             "mluda_dual_counterpart": "real target x_t + unlabeled SceneShift(x_s; target stats, alpha=0.8)",
+            "mluda_dual_counterpart_ce025": "real target x_t + unlabeled SceneShift counterpart + shifted-source CE (0.25)",
+            "mluda_dual_counterpart_ce05": "real target x_t + unlabeled SceneShift counterpart + shifted-source CE (0.5)",
+            "mluda_dual_target_control": "real target x_t1 + independent real target x_t2",
         }[args.method],
+        "dual_gamma": args.dual_gamma,
+        "shifted_source_ce_weight": {
+            "mluda_dual_counterpart": 0.0,
+            "mluda_dual_counterpart_ce025": 0.25,
+            "mluda_dual_counterpart_ce05": 0.5,
+        }.get(args.method, None),
         "target_training_sampling": "all target pixels; no target GT mask",
         "target_gt_used_for_training_or_selection": False,
         "full_mluda_components": [
