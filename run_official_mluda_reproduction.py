@@ -46,8 +46,8 @@ def instrument(source, config_module):
     assert source.count(seed_marker) == 1
     source = source.replace(seed_marker, '\n    _save_seed(globals())\n' + seed_marker)
     plot_marker = '#################classification map'
-    assert source.count(plot_marker) == 1
-    source = source.split(plot_marker)[0]
+    if source.count(plot_marker) == 1:
+        source = source.split(plot_marker)[0]
     ast.parse(source)
     return source
 
@@ -61,7 +61,9 @@ def run(dataset, prepare_only=False, extension=None):
     snapshot = root / 'source_snapshot'
     snapshot.mkdir(exist_ok=True)
     # Snapshot Python dependencies, preserving local regular forward behavior.
-    source_repo = BASE / dataset / 'source_snapshot' if extension else REPO
+    source_repo = (extension.SOURCE_REPO / dataset / 'source_snapshot'
+                   if extension and hasattr(extension, 'SOURCE_REPO')
+                   else (BASE / dataset / 'source_snapshot' if extension else REPO))
     for path in source_repo.glob('*.py'):
         shutil.copy2(path, snapshot / path.name)
     # The worktree contains only device-selection changes in these losses.

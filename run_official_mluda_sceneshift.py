@@ -10,6 +10,9 @@ import run_official_mluda_reproduction as baseline
 HERE = Path(__file__).resolve().parent
 BASE = HERE / 'runs_mluda_official_sceneshift_v1'
 SUMMARY = HERE / 'summarize_official_mluda_sceneshift.py'
+EXTRA_SOURCE_SCL = True
+PURE_AFFINE = False
+EXTRA_COMPONENT = 'both'
 
 
 def instrument(code):
@@ -68,7 +71,11 @@ def hooks(dataset, root):
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 x = g['source_data']
                 model = g['feature_encoder']
-                shifted = shift(x.cuda(), *g['_shift_stats'], alpha=.8)
+                if PURE_AFFINE:
+                    sm,ss,tm,ts = [torch.as_tensor(v,device='cuda',dtype=x.dtype)[None,:,None,None] for v in g['_shift_stats']]
+                    shifted = (x.cuda()-sm)/(ss+1e-5)*(.8*ts+.2*ss)+.8*tm+.2*sm
+                else:
+                    shifted = shift(x.cuda(), *g['_shift_stats'], alpha=.8)
                 assert shifted.shape == x.shape and torch.isfinite(shifted).all()
                 # Match the original augmentation order and raw/augmented forwards.
                 u = g['utils']
@@ -82,10 +89,21 @@ def hooks(dataset, root):
                 pseudo = raw[8].softmax(1).detach().argmax(1)
                 lmmd = g['mmd'].lmmd(raw[0], raw[5], g['source_label'], raw[8].softmax(1),
                                      BATCH_SIZE=g['BATCH_SIZE'], CLASS_NUM=g['CLASS_NUM'])
-                source_scl = g['ContrastiveLoss_s'](torch.stack([aug0[1], aug1[1]], 1), g['source_label'])
+                source_scl = g['ContrastiveLoss_s'](torch.stack([aug0[1], aug1[1]], 1), g['source_label']) if EXTRA_SOURCE_SCL else shifted.new_zeros(())
                 shifted_scl = g['ContrastiveLoss_t'](torch.stack([aug0[7], aug1[7]], 1), pseudo)
                 coef = .3 if dataset == 'pavia' else .01
-                loss = coef * g['lambd'] * lmmd + source_scl + shifted_scl
+                lmmd_term = coef * g['lambd'] * lmmd
+                assert EXTRA_COMPONENT in ('both', 'lmmd', 'scl')
+                loss = source_scl
+                if EXTRA_COMPONENT in ('both', 'lmmd'):
+                    loss = loss + lmmd_term
+                if EXTRA_COMPONENT in ('both', 'scl'):
+                    loss = loss + shifted_scl
+                if EXTRA_COMPONENT != 'both':
+                    with (root / 'component_losses.jsonl').open('a') as f:
+                        f.write(json.dumps(dict(epoch=int(g['epoch']),
+                            lmmd_shift=float(lmmd_term.detach()), shifted_scl=float(shifted_scl.detach()),
+                            selected_extra=float(loss.detach()), component=EXTRA_COMPONENT)) + '\n')
                 if not torch.isfinite(loss):
                     raise RuntimeError('Nonfinite intermediate adaptation loss')
                 return loss
