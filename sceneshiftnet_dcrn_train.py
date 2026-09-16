@@ -142,6 +142,10 @@ def run(args, spec, load_cubes, output_root, runner_file):
     if args.epochs != 100:
         ilda_tag = "ilda" if args.use_ilda else "noilda"
         output = Path(str(output) + f"_smoke_{args.epochs}ep_{ilda_tag}_{args.normalization}")
+    elif getattr(args, "lambda_align", 0.0) > 0:
+        output = Path(str(output) + f"_align{args.lambda_align:g}")
+    elif getattr(args, "lambda_margin", 0.0) > 0:
+        output = Path(str(output) + f"_margin{args.lambda_margin:g}")
     output.mkdir(parents=True, exist_ok=True)
 
     source, source_gt, target, target_gt, data_files = load_cubes(args.normalization)
@@ -222,6 +226,9 @@ def run(args, spec, load_cubes, output_root, runner_file):
         "smooth_noise": False,
         "lambda_shift": 0.5,
         "lambda_target": 0.5,
+        "margin": float(getattr(args, "margin", 0.2)),
+        "lambda_margin": float(getattr(args, "lambda_margin", 0.0)),
+        "lambda_align": float(getattr(args, "lambda_align", 0.0)),
         "pseudo_threshold": 0.9,
         "pseudo_warmup_epochs": 10,
         "optimizer": "SGD" if protocol_matched else "Adam",
@@ -266,10 +273,11 @@ def run(args, spec, load_cubes, output_root, runner_file):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4)
         model.train()
         target_iterator = iter(target_train_loader)
-        sums = np.zeros(3, dtype=np.float64)
+        sums = np.zeros(5, dtype=np.float64)
         correct = np.zeros(2, dtype=np.int64)
         selected = seen = count = 0
         histogram = np.zeros(spec.classes, dtype=np.int64)
+        aligned_count = 0
 
         source_batches = enumerate(source_loader)
         for batch_index, (inputs, labels) in source_batches:
@@ -283,14 +291,15 @@ def run(args, spec, load_cubes, output_root, runner_file):
                 target_iterator = iter(target_train_loader)
                 target_inputs = next(target_iterator)
             inputs, labels, target_inputs = inputs.to(device), labels.to(device), target_inputs.to(device)
-            source_logits = model(inputs)[1]
+            source_features, source_logits = model(inputs)
             if args.method == "sceneshift":
                 shifted = (inputs - sm) / (ss + 1e-5)
                 shifted = shifted * (0.8 * ts + 0.2 * ss) + 0.8 * tm + 0.2 * sm
-                shifted_logits = model(shifted)[1]
+                shifted_features, shifted_logits = model(shifted)
             else:
                 shifted_logits = None
-            target_logits = model(target_inputs)[1]
+                shifted_features = None
+            target_features, target_logits = model(target_inputs)
             confidence, pseudo = target_logits.softmax(1).max(1)
             mask = confidence > 0.9 if epoch > 10 else torch.zeros_like(confidence, dtype=torch.bool)
             target_loss = (
@@ -298,9 +307,34 @@ def run(args, spec, load_cubes, output_root, runner_file):
             )
             source_loss = criterion(source_logits, labels)
             shifted_loss = criterion(shifted_logits, labels) if shifted_logits is not None else source_loss.new_zeros(())
+            margin_loss = source_loss.new_zeros(())
+            active_ratio = 0.0
+            if shifted_features is not None and getattr(args, "lambda_margin", 0.0) > 0:
+                classes = labels.unique()
+                ps = torch.stack([source_features[labels == cls].mean(0) for cls in classes])
+                psh = torch.stack([shifted_features[labels == cls].mean(0) for cls in classes])
+                sim = torch.nn.functional.normalize(psh, dim=1) @ torch.nn.functional.normalize(ps, dim=1).T
+                if len(classes) > 1:
+                    pos = sim.diag()[:, None]
+                    violations = torch.relu(float(getattr(args, "margin", 0.2)) - pos + sim)
+                    mask_offdiag = ~torch.eye(len(classes), dtype=torch.bool, device=sim.device)
+                    vals = violations[mask_offdiag]
+                    margin_loss = vals.mean()
+                    active_ratio = float((vals > 0).float().mean().item())
+            align_loss = source_loss.new_zeros(())
+            if shifted_features is not None and getattr(args, "lambda_align", 0.0) > 0 and epoch > 10 and mask.any():
+                classes = labels.unique()
+                prototypes = {int(cls): shifted_features[labels == cls].mean(0) for cls in classes}
+                terms = [1.0 - torch.nn.functional.cosine_similarity(target_features[i:i+1], prototypes[int(cls)][None]).squeeze()
+                         for i, cls in enumerate(pseudo) if int(cls) in prototypes]
+                if terms:
+                    align_loss = torch.stack(terms).mean()
+                    aligned_count += len(terms)
             loss = source_loss + (0.5 * shifted_loss if args.method == "sceneshift" else 0)
             if epoch > 10:
                 loss = loss + 0.5 * target_loss
+            loss = loss + getattr(args, "lambda_margin", 0.0) * margin_loss
+            loss = loss + getattr(args, "lambda_align", 0.0) * align_loss
             if not all(torch.isfinite(value) for value in (source_loss, shifted_loss, target_loss, loss)):
                 raise RuntimeError(f"NaN/Inf at epoch {epoch}")
 
@@ -309,7 +343,7 @@ def run(args, spec, load_cubes, output_root, runner_file):
             optimizer.step()
 
             batch = len(labels)
-            sums += np.array([source_loss.item(), shifted_loss.item(), target_loss.item()]) * batch
+            sums += np.array([source_loss.item(), shifted_loss.item(), target_loss.item(), margin_loss.item(), align_loss.item()]) * batch
             correct[0] += (source_logits.argmax(1) == labels).sum().item()
             if shifted_logits is not None:
                 correct[1] += (shifted_logits.argmax(1) == labels).sum().item()
@@ -323,6 +357,10 @@ def run(args, spec, load_cubes, output_root, runner_file):
             "L_src": float(sums[0] / count),
             "L_shift": float(sums[1] / count),
             "L_target": float(sums[2] / count),
+            "L_margin": float(sums[3] / count),
+            "active_margin_violations_ratio": active_ratio,
+            "L_align": float(sums[4] / count),
+            "valid_aligned_target_samples": int(aligned_count),
             "pseudo_label_coverage": float(selected / seen),
             "pseudo_label_class_histogram": histogram.tolist(),
             "source_accuracy": float(correct[0] / count),

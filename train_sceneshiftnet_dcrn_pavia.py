@@ -42,6 +42,8 @@ if __name__ == "__main__":
     parser.add_argument("--source-per-class", type=int, default=180)
     parser.add_argument("--use-ilda", type=parse_bool, default=False)
     parser.add_argument("--normalization", choices=("loader", "none"), default="none")
+    parser.add_argument("--lambda-margin", type=float, default=0.0)
+    parser.add_argument("--margin", type=float, default=0.2)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     run(args, SPEC, load_cubes, Path(__file__).parent / "runs_sceneshiftnet_dcrn/pavia", __file__)
