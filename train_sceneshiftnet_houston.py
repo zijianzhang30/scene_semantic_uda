@@ -23,23 +23,23 @@ def main():
  for k in range(1,8):
   ij=np.argwhere(sg==k); np.random.shuffle(ij); tr+=ij[:180].tolist(); va+=ij[180:].tolist()
  tr=np.array(tr); va=np.array(va); np.random.shuffle(tr); np.random.shuffle(va)
- tx=patches(src,tr); ty=sg[tr[:,0],tr[:,1]]-1; vx=patches(src,va); vy=sg[va[:,0],va[:,1]]-1
- flat_t=np.argwhere(tg>0); testx=patches(tgt,flat_t); testy=tg[flat_t[:,0],flat_t[:,1]]-1
+ tx=patches(src,tr); ty=(sg[tr[:,0],tr[:,1]]-1).astype('int64'); vx=patches(src,va); vy=(sg[va[:,0],va[:,1]]-1).astype('int64')
+ flat_t=np.argwhere(tg>0); testx=patches(tgt,flat_t); testy=(tg[flat_t[:,0],flat_t[:,1]]-1).astype('int64')
  sm,ss=src.reshape(-1,48).mean(0),src.reshape(-1,48).std(0); tm,ts=tgt.reshape(-1,48).mean(0),tgt.reshape(-1,48).std(0)
- config={'seed':a.seed,'epochs':a.epochs,'source':'Houston13','target':'Houston18','classes':7,'source_per_class':180,'patch_size':7,'bands':48,'alpha':.8,'lambda_shift':.5,'lambda_target':.5,'pseudo_threshold':.9,'preprocessing':'official load_data_houston + ILDA(pca=2,radius=.009)','optimizer':'Adam','lr':1e-3,'target_pool':'GT>0 for evaluation; unlabeled pool for training','model':'SceneShiftNet shared Conv1x1/3x3 encoder 128-d + linear classifier','code_hash':sha(__file__),'model_hash':sha(Path(__file__).with_name('models')/'sceneshift_net.py')}
+ config={'seed':a.seed,'epochs':a.epochs,'source':'Houston13','target':'Houston18','classes':7,'source_per_class':180,'patch_size':7,'bands':48,'alpha':.8,'gamma':.5,'scene_shift_type':'pure_affine','random_scale':False,'smooth_noise':False,'lambda_shift':.5,'lambda_target':.5,'pseudo_threshold':.9,'pseudo_warmup_epochs':10,'preprocessing':'official load_data_houston + ILDA(pca=2,radius=.009)','optimizer':'Adam','lr':1e-3,'target_pool':'GT>0 support mask (labels not used in training)','evaluation':'final epoch target OA/AA/Kappa/per-class','model':'SceneShiftNet shared encoder 128-d + linear classifier','code_hash':sha(__file__),'model_hash':sha(Path(__file__).with_name('models')/'sceneshift_net.py')}
  (out/'config.json').write_text(json.dumps(config,indent=2));
  if a.prepare_only: print('PREPARED',out); return
- dev=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); model=SceneShiftNet().to(dev); opt=torch.optim.Adam(model.parameters(),lr=1e-3); dl=DataLoader(TensorDataset(torch.from_numpy(tx),torch.from_numpy(ty)),32,shuffle=True,drop_last=True); tdl=DataLoader(torch.from_numpy(patches(tgt,np.argwhere(tg>0))),32,shuffle=True,drop_last=True); ce=torch.nn.CrossEntropyLoss(); hist=[]
+ dev=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); model=SceneShiftNet().to(dev); opt=torch.optim.Adam(model.parameters(),lr=1e-3); dl=DataLoader(TensorDataset(torch.from_numpy(tx),torch.from_numpy(ty)),32,shuffle=True,drop_last=True); tdl=DataLoader(torch.from_numpy(patches(tgt,np.argwhere(tg>0))),32,shuffle=True,drop_last=True); ce=torch.nn.CrossEntropyLoss(); histlog=[]
  for ep in range(1,a.epochs+1):
-  model.train(); it=iter(tdl); sums=[0.,0.,0.]; cov=0; n=0
+  model.train(); it=iter(tdl); sums=[0.,0.,0.]; corr=[0,0]; cov=0; n=0; seen=0; hist=np.zeros(7,dtype=int)
   for x,y in dl:
    try: z=next(it)
    except StopIteration: it=iter(tdl); z=next(it)
    x,y,z=x.to(dev),y.to(dev),z.to(dev); shifted=(x-torch.tensor(sm,device=dev)[None,:,None,None])/(torch.tensor(ss,device=dev)[None,:,None,None]+1e-5)*(0.8*torch.tensor(ts,device=dev)[None,:,None,None]+0.2*torch.tensor(ss,device=dev)[None,:,None,None])+0.8*torch.tensor(tm,device=dev)[None,:,None,None]+0.2*torch.tensor(sm,device=dev)[None,:,None,None]
-   _,os=model(x); _,oss=model(shifted); ft,ot=model(z); conf,pseudo=ot.softmax(1).max(1); mask=conf>.9; lt=ce(ot[mask],pseudo[mask]) if mask.any() else ot.sum()*0; ls=ce(os,y); lss=ce(oss,y); loss=ls+.5*lss+.5*lt; opt.zero_grad(); loss.backward(); opt.step(); sums[0]+=ls.item(); sums[1]+=lss.item(); sums[2]+=lt.item(); cov+=int(mask.sum()); n+=len(y)
-  row={'epoch':ep,'L_src':sums[0]/n,'L_shift':sums[1]/n,'L_target':sums[2]/n,'pseudo_coverage':cov/n}; hist.append(row); print(json.dumps(row),flush=True)
+   _,os=model(x); _,oss=model(shifted); _,ot=model(z); conf,pseudo=ot.softmax(1).max(1); mask=(conf>.9) if ep>10 else torch.zeros_like(conf,dtype=torch.bool); lt=ce(ot[mask],pseudo[mask]) if mask.any() else ot.sum()*0; ls=ce(os,y); lss=ce(oss,y); loss=ls+.5*lss+(.5*lt if ep>10 else 0*lt); opt.zero_grad(); loss.backward(); opt.step(); bs=len(y); sums[0]+=ls.item()*bs; sums[1]+=lss.item()*bs; sums[2]+=lt.item()*bs; corr[0]+=(os.argmax(1)==y).sum().item(); corr[1]+=(oss.argmax(1)==y).sum().item(); cov+=int(mask.sum()); seen+=len(z); hist+=np.bincount(pseudo[mask].detach().cpu().numpy(),minlength=7); n+=bs
+  row={'epoch':ep,'L_src':sums[0]/n,'L_shift':sums[1]/n,'L_target':sums[2]/n,'pseudo_label_coverage':cov/seen,'pseudo_label_class_histogram':hist.tolist(),'source_accuracy':corr[0]/n,'shifted_source_accuracy':corr[1]/n}; histlog.append(row); print(json.dumps(row),flush=True)
  torch.save({'model':model.state_dict(),'seed':a.seed},out/'final.pth'); model.eval(); pred=[]
  with torch.no_grad():
   for i in range(0,len(testx),32): pred.extend(model(torch.from_numpy(testx[i:i+32]).to(dev))[1].argmax(1).cpu().numpy())
- pred=np.array(pred); cm=metrics.confusion_matrix(testy,pred,labels=np.arange(7)); pc=np.diag(cm)/cm.sum(1); res={'oa':float((pred==testy).mean()*100),'aa':float(pc.mean()*100),'kappa':float(metrics.cohen_kappa_score(testy,pred)*100),'per_class_accuracy':(pc*100).tolist(),'seed':a.seed}; (out/'history.json').write_text(json.dumps(hist,indent=2)); (out/'result.json').write_text(json.dumps(res,indent=2)); print(json.dumps(res,indent=2))
+ pred=np.array(pred); cm=metrics.confusion_matrix(testy,pred,labels=np.arange(7)); pc=np.diag(cm)/cm.sum(1); res={'oa':float((pred==testy).mean()*100),'aa':float(pc.mean()*100),'kappa':float(metrics.cohen_kappa_score(testy,pred)*100),'per_class_accuracy':(pc*100).tolist(),'seed':a.seed}; (out/'history.json').write_text(json.dumps(histlog,indent=2)); (out/'result.json').write_text(json.dumps(res,indent=2)); print(json.dumps(res,indent=2))
 if __name__=='__main__': main()
