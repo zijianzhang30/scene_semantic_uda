@@ -38,12 +38,15 @@ def compute_soft_membership(
     beta: float = 1.0,
     temperature: float = 1.0,
     eps: float = 1e-8,
+    valid_classes: Optional[Tensor] = None,
 ) -> Tensor:
     """Compute detached r_j^c from classifier probabilities and cosine similarity."""
     if target_probabilities.shape != (target_features.shape[0], source_prototypes.shape[0]):
         raise ValueError("target probabilities must have shape [Bt, num_classes]")
     cosine = F.normalize(target_features, dim=-1) @ F.normalize(source_prototypes, dim=-1).t()
     logits = torch.log(target_probabilities.clamp_min(eps)) + beta * cosine
+    if valid_classes is not None:
+        logits = logits.masked_fill(~valid_classes[None, :], -torch.finfo(logits.dtype).max)
     return F.softmax(logits / temperature, dim=-1).detach()
 
 
@@ -110,7 +113,8 @@ def sample_ot_pairs(
         coupling = item["coupling"]
         flat = coupling.flatten()
         count = flat.numel() if max_pairs_per_class is None else min(max_pairs_per_class, flat.numel())
-        chosen = torch.topk(flat, count).indices
+        prob = flat / flat.sum().clamp_min(1e-12)
+        chosen = torch.multinomial(prob, count, replacement=True)
         si, ti = torch.unravel_index(chosen, coupling.shape)
         src.append(source_features[item["source_indices"][si]])
         tgt.append(target_features[item["target_indices"][ti]])
@@ -152,11 +156,44 @@ def flow_matching_loss(model: ConditionalFlowMLP, source: Tensor, target: Tensor
     return F.mse_loss(model(z_tau, tau, class_labels), velocity)
 
 
+def flow_transport(model: ConditionalFlowMLP, source: Tensor, class_labels: Tensor,
+                   tau: Tensor, steps: int = 8) -> Tensor:
+    """Differentiable Euler rollout from source to independently sampled tau."""
+    z = source
+    for k in range(steps):
+        t0 = tau * (float(k) / steps)
+        dt = tau / steps
+        z = z + dt[:, None] * model(z, t0, class_labels)
+    return z
+
+
 def bridge_classification_loss(classifier: nn.Module, source: Tensor, target: Tensor,
-                               class_labels: Tensor, tau_max: float = 0.3) -> Tensor:
+                               class_labels: Tensor, tau_max: float = 0.3,
+                               flow_model: Optional[ConditionalFlowMLP] = None) -> Tensor:
     tau = torch.rand(source.shape[0], device=source.device) * tau_max
-    z_tau = (1.0 - tau[:, None]) * source + tau[:, None] * target
+    z_tau = ((1.0 - tau[:, None]) * source + tau[:, None] * target if flow_model is None
+             else flow_transport(flow_model, source, class_labels, tau))
     return F.cross_entropy(classifier(z_tau), class_labels)
+
+
+def gradient_diagnostic(encoder: nn.Module, classifier: nn.Module,
+                        flow: ConditionalFlowMLP, source: Tensor, target: Tensor,
+                        labels: Tensor) -> Dict[str, Dict[str, float]]:
+    """Check intended parameter ownership for source/FM/bridge losses."""
+    def norm(module):
+        return float(sum((p.grad.detach().norm() ** 2 for p in module.parameters() if p.grad is not None), torch.tensor(0.)).sqrt())
+    out = {}
+    for name in ('src', 'fm', 'bridge'):
+        for m in (encoder, classifier, flow):
+            m.zero_grad(set_to_none=True)
+        src_logits = classifier(encoder(source))
+        if name == 'src': loss = F.cross_entropy(src_logits, labels)
+        elif name == 'fm': loss = flow_matching_loss(flow, encoder(source).detach(), target.detach(), labels)
+        else:
+            z = flow_transport(flow, encoder(source), labels, torch.full((source.shape[0],), .3, device=source.device))
+            loss = F.cross_entropy(classifier(z), labels)
+        loss.backward(); out[name] = {'encoder':norm(encoder), 'classifier':norm(classifier), 'flow':norm(flow)}
+    return out
 
 
 def _synthetic_test(seed: int = 7) -> None:
