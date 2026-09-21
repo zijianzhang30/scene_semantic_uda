@@ -1,10 +1,10 @@
-"""Strict-MLUDA Houston experiment with agreement-aware weighted OT.
+"""Strict-MLUDA Houston experiment with JS-weighted OT and flow matching.
 
 This entry is intentionally separate from ``train_houston_v04.py``.  It
 executes the server's official ``MLUDA_hu.py`` data/model/evaluation path and
 replaces only the adaptation objective with
 
-    source CE + 0.1 * agreement-weighted class-conditional linear bridge CE.
+    source CE + flow matching MSE + 0.1 * rollout semantic CE.
 
 Target labels are passed only to the detached diagnostics.  They never affect
 membership, reliability, OT, pair sampling, or gradients.
@@ -31,8 +31,10 @@ import config_Houston as cfg
 import utils
 import UtilsCMS
 sys.path.insert(0, str(ROOT))
-from class_conditional_flow_uda import (
-    bridge_classification_loss,
+from class_conditional_flow import (
+    AgreementFlowMLP,
+    agreement_flow_matching_loss,
+    agreement_flow_rollout,
     compute_source_prototypes,
     sample_ot_pairs,
 )
@@ -145,7 +147,10 @@ class EpochDiagnostics:
         self.pairs = torch.zeros(NUM_CLASSES, dtype=torch.long)
         self.cost_sum = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.cost_weight = torch.zeros(NUM_CLASSES, dtype=torch.float64)
-        self.source_loss_sum = self.bridge_loss_sum = 0.0
+        self.source_loss_sum = self.fm_loss_sum = self.semantic_loss_sum = 0.0
+        self.pair_distance_sum = self.pred_velocity_sum = self.target_velocity_sum = 0.0
+        self.velocity_cosine_sum = self.rollout_distance_sum = self.transport_correct = 0.0
+        self.transport_n = 0
         self.batches = 0
 
     @torch.no_grad()
@@ -177,9 +182,18 @@ class EpochDiagnostics:
             self.cost_sum[class_id] += float((coupling * item["cost"]).sum())
             self.cost_weight[class_id] += weight
 
-    def observe_losses(self, source_loss, bridge_loss):
+    def observe_losses(self, source_loss, fm_loss, semantic_loss, flow_stats, rollout, target, classes, classifier):
         self.source_loss_sum += float(source_loss.detach())
-        self.bridge_loss_sum += float(bridge_loss.detach())
+        self.fm_loss_sum += float(fm_loss.detach())
+        self.semantic_loss_sum += float(semantic_loss.detach())
+        if flow_stats:
+            self.pair_distance_sum += float(flow_stats["pair_distance"])
+            self.pred_velocity_sum += float(flow_stats["predicted_velocity_norm"])
+            self.target_velocity_sum += float(flow_stats["target_velocity_norm"])
+            self.velocity_cosine_sum += float(flow_stats["velocity_cosine"])
+            self.rollout_distance_sum += float((rollout.detach() - target).norm(dim=1).mean())
+            self.transport_correct += int((classifier(rollout.detach()).argmax(1) == classes).sum())
+            self.transport_n += len(classes)
         self.batches += 1
 
     def summary(self):
@@ -204,14 +218,21 @@ class EpochDiagnostics:
             "per_class_ot_pair_count": self.pairs.tolist(),
             "per_class_average_ot_cost": costs,
             "source_loss": self.source_loss_sum / max(self.batches, 1),
-            "bridge_loss": self.bridge_loss_sum / max(self.batches, 1),
+            "fm_loss": self.fm_loss_sum / max(self.batches, 1),
+            "semantic_loss": self.semantic_loss_sum / max(self.batches, 1),
+            "mean_pair_distance": self.pair_distance_sum / max(self.batches, 1),
+            "mean_predicted_velocity_norm": self.pred_velocity_sum / max(self.batches, 1),
+            "mean_target_velocity_norm": self.target_velocity_sum / max(self.batches, 1),
+            "mean_velocity_cosine": self.velocity_cosine_sum / max(self.batches, 1),
+            "mean_rollout_target_distance": self.rollout_distance_sum / max(self.batches, 1),
+            "transported_accuracy": self.transport_correct / max(self.transport_n, 1),
             "target_observations": self.n,
             "batches": self.batches,
         }
 
 
-def adaptation(model, source_features, target_features, target_logits, source_labels,
-               target_labels, prototypes, valid_classes, epoch, diagnostics, transport_method):
+def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
+               target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant):
     diagnostics.begin(epoch)
     with torch.no_grad():
         q = target_logits.detach().softmax(1)
@@ -220,11 +241,7 @@ def adaptation(model, source_features, target_features, target_logits, source_la
         )
         top2 = r.topk(2, dim=1).values
         margin = top2[:, 0] - top2[:, 1]
-        target_weight = {
-            "js": agreement,
-            "soft": torch.ones_like(agreement),
-            "margin": margin,
-        }[transport_method]
+        target_weight = agreement
         diagnostics.observe_target(q, s, r, agreement, margin, target_weight, target_labels)
         ot = classwise_sinkhorn_ot_weighted(
             source_features.detach(), source_labels, target_features.detach(), r, target_weight,
@@ -235,14 +252,17 @@ def adaptation(model, source_features, target_features, target_logits, source_la
         ot, source_features, target_features.detach(), max_pairs_per_class=32
     )
     diagnostics.observe_ot(ot, pair_classes)
-    bridge_loss = source_features.sum() * 0.0
+    fm_loss = source_features.sum() * 0.0
+    semantic_loss = source_features.sum() * 0.0
+    rollout = pair_source
+    flow_stats = None
     if len(pair_classes):
-        tau_max = 0.3 if epoch <= 20 else 0.5 if epoch <= 50 else 0.8
-        bridge_loss = bridge_classification_loss(
-            model.fc1, pair_source, pair_target, pair_classes, tau_max
-        )
-    assert torch.isfinite(bridge_loss)
-    return bridge_loss
+        fm_loss, flow_stats = agreement_flow_matching_loss(flow, pair_source, pair_target)
+        rollout_source = pair_source if flow_variant == "flow_a" else pair_source.detach()
+        rollout = agreement_flow_rollout(flow, rollout_source, num_steps=4)
+        semantic_loss = F.cross_entropy(model.fc1(rollout), pair_classes)
+    assert torch.isfinite(fm_loss) and torch.isfinite(semantic_loss)
+    return fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes
 
 
 def metrics_from_predictions(predictions, labels):
@@ -268,7 +288,7 @@ def main():
     parser.add_argument("--mode", choices=["prepare", "train", "self-test"], default="train")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=1341)
-    parser.add_argument("--transport", choices=["js", "soft", "margin"], default="js")
+    parser.add_argument("--variant", choices=["flow_a", "flow_b"], default="flow_a")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.mode == "self-test":
@@ -289,6 +309,16 @@ def main():
         assert torch.allclose(r.sum(1), torch.ones(nt), atol=1e-6)
         assert agreement.min() >= 0 and agreement.max() <= 1
         assert margin.min() >= 0 and margin.max() <= 1
+        flow = AgreementFlowMLP(dim)
+        pair_source, pair_target = source[:8].clone().requires_grad_(), target[:8].clone()
+        fm_loss, _ = agreement_flow_matching_loss(flow, pair_source, pair_target)
+        rollout = agreement_flow_rollout(flow, pair_source, num_steps=4)
+        semantic_loss = rollout.square().mean()
+        fm_loss.backward(retain_graph=True)
+        assert pair_source.grad is None, "FM must not update source/backbone features"
+        flow.zero_grad(set_to_none=True)
+        semantic_loss.backward()
+        assert pair_source.grad is not None, "Flow-A semantic loss must reach source/backbone features"
         print(json.dumps({"self_test": "ok", "classes_with_ot": sorted(ot), "r_row_sum_max_error": float((r.sum(1)-1).abs().max())}))
         return
 
@@ -319,7 +349,7 @@ def main():
     cfg.seeds = [args.seed]
     cfg.nDataSet = 1
     cfg.epochs = args.epochs
-    out = args.out / f"{args.transport}_transport"
+    out = args.out / args.variant
     out.mkdir(exist_ok=True)
     official_path = LEGACY / "MLUDA_hu.py"
     original = official_path.read_text()
@@ -329,6 +359,11 @@ def main():
     )
     start = code.index("            # 0\n")
     end = code.index("            # Update parameters", start)
+    code = code.replace("feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()",
+                        "feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()\n    flow = AgreementFlowMLP(288).cuda()")
+    code = code.replace("{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},",
+                        "{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},\n            {'params': flow.parameters(), 'lr': LEARNING_RATE},")
+    code = code.replace("feature_encoder.train()", "feature_encoder.train()\n        flow.train()")
     replacement = '''            if i == 1:
                 prototypes, valid_classes = global_source_prototypes(
                     feature_encoder, trainX, trainY, target_data.cuda())
@@ -336,12 +371,13 @@ def main():
              target_features, _, target1, target_outputs, target_out) = feature_encoder(
                     source_data.cuda(), target_data.cuda())
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
-            bridge_loss = adaptation(
-                feature_encoder, source_features, target_features, target_outputs,
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+                feature_encoder, flow, source_features, target_features, target_outputs,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, transport_method)
-            loss = cls_loss + 0.1 * bridge_loss
-            diagnostics.observe_losses(cls_loss, bridge_loss)
+                epoch, diagnostics, flow_variant)
+            loss = cls_loss + fm_loss + 0.1 * semantic_loss
+            diagnostics.observe_losses(cls_loss, fm_loss, semantic_loss, flow_stats,
+                                       rollout, pair_target, pair_classes, feature_encoder.fc1)
             # Values retained only for the unchanged official progress formatter.
             lmmd_loss = contrastive_loss_s = contrastive_loss_t = loss.detach() * 0
 
@@ -362,7 +398,7 @@ def main():
             "initial_model": hashlib.sha256(b"".join(
                 value.detach().cpu().numpy().tobytes() for value in model.state_dict().values()
             )).hexdigest(),
-            "seed": args.seed, "epochs": args.epochs, "transport": args.transport,
+            "seed": args.seed, "epochs": args.epochs, "variant": args.variant,
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
             "official_file_sha256": hashlib.sha256(original.encode()).hexdigest(),
@@ -393,14 +429,15 @@ def main():
         "global_source_prototypes": global_source_prototypes,
         "adaptation": adaptation,
         "diagnostics": diagnostics,
-        "transport_method": args.transport,
+        "flow_variant": args.variant,
+        "AgreementFlowMLP": AgreementFlowMLP,
     }
     (out / "executed.py").write_text(code)
     os.chdir(LEGACY)
     exec(compile(code, str(official_path), "exec"), namespace)
     result = {"epoch": args.epochs, **history[-1], "selection": f"fixed_epoch{args.epochs}"}
     result["gpu_max_allocated"] = torch.cuda.max_memory_allocated()
-    torch.save({"model": namespace["feature_encoder"].state_dict(), "metrics": result}, out / f"epoch{args.epochs}.pth")
+    torch.save({"model": namespace["feature_encoder"].state_dict(), "flow": namespace["flow"].state_dict(), "metrics": result}, out / f"epoch{args.epochs}.pth")
     (out / "results.json").write_text(json.dumps(result, indent=2))
     print("FINAL", json.dumps(result), flush=True)
 
