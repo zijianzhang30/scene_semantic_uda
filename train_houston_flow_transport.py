@@ -32,7 +32,7 @@ import utils
 import UtilsCMS
 sys.path.insert(0, str(ROOT))
 from class_conditional_flow import (
-    AgreementFlowMLP,
+    ConditionalFlowMLP,
     agreement_flow_matching_loss,
     agreement_flow_rollout,
     compute_source_prototypes,
@@ -48,7 +48,7 @@ def sha(array: np.ndarray) -> str:
 
 
 @torch.no_grad()
-def global_source_prototypes(model, train_x, train_y, target_context):
+def global_source_prototypes(model, train_x, train_y, target_context, shift_stats=None):
     """Compute epoch-global GT source prototypes on the official feature path."""
     was_training = model.training
     model.eval()
@@ -57,6 +57,8 @@ def global_source_prototypes(model, train_x, train_y, target_context):
     try:
         for start in range(0, len(train_x), 32):
             source = torch.as_tensor(train_x[start : start + 32]).cuda()
+            if shift_stats is not None:
+                source = scene_shift_batch(source, *shift_stats, alpha=0.8)
             features.append(model(source, target_context[: len(source)])[0])
         assert all(torch.equal(buffers[name], value) for name, value in model.named_buffers())
         features = torch.cat(features)
@@ -149,8 +151,16 @@ class EpochDiagnostics:
         self.cost_weight = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.source_loss_sum = self.fm_loss_sum = self.semantic_loss_sum = 0.0
         self.pair_distance_sum = self.pred_velocity_sum = self.target_velocity_sum = 0.0
+        self.normalized_target_velocity_sum = self.restored_pred_velocity_sum = 0.0
         self.velocity_cosine_sum = self.rollout_distance_sum = self.transport_correct = 0.0
         self.transport_n = 0
+        self.flow_grad_from_fm = None
+        self.flow_grad_from_semantic = 0.0
+        self.source_correct = self.shifted_source_correct = self.source_n = 0
+        self.true6_hist = torch.zeros(NUM_CLASSES, dtype=torch.long)
+        self.q6_correct = self.s6_correct = self.true6_n = 0
+        self.source_target_distance_sum = self.shifted_target_distance_sum = 0.0
+        self.source_target_mmd_sum = self.shifted_target_mmd_sum = 0.0
         self.batches = 0
 
     @torch.no_grad()
@@ -172,6 +182,23 @@ class EpochDiagnostics:
         self.correct_n += int(r_correct.sum())
         self.incorrect_n += int((~r_correct).sum())
         self.mass += (target_weight[:, None] * r).sum(0).double().cpu()
+        true6 = labels == 6
+        self.true6_n += int(true6.sum())
+        self.q6_correct += int((q.argmax(1)[true6] == 6).sum())
+        self.s6_correct += int((s.argmax(1)[true6] == 6).sum())
+        self.true6_hist += torch.bincount(q.argmax(1)[true6].cpu(), minlength=NUM_CLASSES)
+
+    @torch.no_grad()
+    def observe_scene_shift(self, source_logits, shifted_logits, labels, source, shifted, target):
+        self.source_correct += int((source_logits.argmax(1) == labels).sum())
+        self.shifted_source_correct += int((shifted_logits.argmax(1) == labels).sum())
+        self.source_n += len(labels)
+        ds = (source.mean(0) - target.mean(0)).norm()
+        dss = (shifted.mean(0) - target.mean(0)).norm()
+        self.source_target_distance_sum += float(ds)
+        self.shifted_target_distance_sum += float(dss)
+        self.source_target_mmd_sum += float(ds.square())
+        self.shifted_target_mmd_sum += float(dss.square())
 
     @torch.no_grad()
     def observe_ot(self, ot, pair_classes):
@@ -188,13 +215,20 @@ class EpochDiagnostics:
         self.semantic_loss_sum += float(semantic_loss.detach())
         if flow_stats:
             self.pair_distance_sum += float(flow_stats["pair_distance"])
-            self.pred_velocity_sum += float(flow_stats["predicted_velocity_norm"])
-            self.target_velocity_sum += float(flow_stats["target_velocity_norm"])
+            self.pred_velocity_sum += float(flow_stats["predicted_normalized_velocity_norm"])
+            self.target_velocity_sum += float(flow_stats["original_target_velocity_norm"])
+            self.normalized_target_velocity_sum += float(flow_stats["normalized_target_velocity_norm"])
+            self.restored_pred_velocity_sum += float(flow_stats["restored_predicted_velocity_norm"])
             self.velocity_cosine_sum += float(flow_stats["velocity_cosine"])
-            self.rollout_distance_sum += float((rollout.detach() - target).norm(dim=1).mean())
+            rollout_distance = float((rollout.detach() - target).norm(dim=1).mean())
+            self.rollout_distance_sum += rollout_distance
             self.transport_correct += int((classifier(rollout.detach()).argmax(1) == classes).sum())
             self.transport_n += len(classes)
         self.batches += 1
+
+    def observe_gradient_audit(self, fm_norm):
+        if self.flow_grad_from_fm is None:
+            self.flow_grad_from_fm = fm_norm
 
     def summary(self):
         mean = self.a_sum / max(self.n, 1)
@@ -221,18 +255,41 @@ class EpochDiagnostics:
             "fm_loss": self.fm_loss_sum / max(self.batches, 1),
             "semantic_loss": self.semantic_loss_sum / max(self.batches, 1),
             "mean_pair_distance": self.pair_distance_sum / max(self.batches, 1),
-            "mean_predicted_velocity_norm": self.pred_velocity_sum / max(self.batches, 1),
-            "mean_target_velocity_norm": self.target_velocity_sum / max(self.batches, 1),
+            "mean_original_target_velocity_norm": self.target_velocity_sum / max(self.batches, 1),
+            "mean_normalized_target_velocity_norm": self.normalized_target_velocity_sum / max(self.batches, 1),
+            "mean_predicted_normalized_velocity_norm": self.pred_velocity_sum / max(self.batches, 1),
+            "mean_restored_predicted_velocity_norm": self.restored_pred_velocity_sum / max(self.batches, 1),
             "mean_velocity_cosine": self.velocity_cosine_sum / max(self.batches, 1),
             "mean_rollout_target_distance": self.rollout_distance_sum / max(self.batches, 1),
+            "rollout_distance_reduction_ratio": (
+                (self.pair_distance_sum - self.rollout_distance_sum) /
+                max(self.pair_distance_sum, 1e-12)
+            ),
             "transported_accuracy": self.transport_correct / max(self.transport_n, 1),
+            "flow_grad_from_fm": self.flow_grad_from_fm,
+            "flow_grad_from_semantic": self.flow_grad_from_semantic,
             "target_observations": self.n,
             "batches": self.batches,
+            "source_accuracy": self.source_correct / max(self.source_n, 1),
+            "shifted_source_accuracy": self.shifted_source_correct / max(self.source_n, 1),
+            "target_q_class6_accuracy": self.q6_correct / max(self.true6_n, 1),
+            "target_s_ss_class6_accuracy": self.s6_correct / max(self.true6_n, 1),
+            "true_class6_q_prediction_histogram": self.true6_hist.tolist(),
+            "source_target_mean_feature_distance": self.source_target_distance_sum / max(self.batches, 1),
+            "shifted_source_target_mean_feature_distance": self.shifted_target_distance_sum / max(self.batches, 1),
+            "source_target_linear_mmd": self.source_target_mmd_sum / max(self.batches, 1),
+            "shifted_source_target_linear_mmd": self.shifted_target_mmd_sum / max(self.batches, 1),
         }
 
 
+def scene_shift_batch(x, source_mean, source_std, target_mean, target_std, alpha=0.8):
+    mapped = (x - source_mean) / (source_std + 1e-5) * target_std + target_mean
+    return (1.0 - alpha) * x + alpha * mapped
+
+
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
-               target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant):
+               target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant,
+               weight_mode="js_product"):
     diagnostics.begin(epoch)
     with torch.no_grad():
         q = target_logits.detach().softmax(1)
@@ -241,10 +298,17 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
         )
         top2 = r.topk(2, dim=1).values
         margin = top2[:, 0] - top2[:, 1]
-        target_weight = agreement
-        diagnostics.observe_target(q, s, r, agreement, margin, target_weight, target_labels)
+        if weight_mode == "q":
+            ot_membership, ot_weight = q, torch.ones_like(agreement)
+        elif weight_mode == "mean_qs":
+            ot_membership, ot_weight = 0.5 * (q + s), torch.ones_like(agreement)
+        elif weight_mode == "s":
+            ot_membership, ot_weight = s, torch.ones_like(agreement)
+        else:
+            ot_membership, ot_weight = r, agreement
+        diagnostics.observe_target(q, s, ot_membership, ot_weight, margin, ot_weight, target_labels)
         ot = classwise_sinkhorn_ot_weighted(
-            source_features.detach(), source_labels, target_features.detach(), r, target_weight,
+            source_features.detach(), source_labels, target_features.detach(), ot_membership, ot_weight,
             NUM_CLASSES, reg=0.05, iterations=100,
         )
         assert all(torch.isfinite(item["coupling"]).all() for item in ot.values())
@@ -257,10 +321,15 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
     rollout = pair_source
     flow_stats = None
     if len(pair_classes):
-        fm_loss, flow_stats = agreement_flow_matching_loss(flow, pair_source, pair_target)
-        rollout_source = pair_source if flow_variant == "flow_a" else pair_source.detach()
-        rollout = agreement_flow_rollout(flow, rollout_source, num_steps=4)
-        semantic_loss = F.cross_entropy(model.fc1(rollout), pair_classes)
+        fm_loss, flow_stats = agreement_flow_matching_loss(flow, pair_source, pair_target, pair_classes)
+        if diagnostics.flow_grad_from_fm is None:
+            gradients = torch.autograd.grad(fm_loss, tuple(flow.parameters()), retain_graph=True)
+            gradient_norm = torch.stack([gradient.detach().norm() for gradient in gradients]).square().sum().sqrt()
+            diagnostics.observe_gradient_audit(float(gradient_norm))
+        # Diagnostic only: semantic loss has no graph to flow, classifier, or backbone.
+        with torch.no_grad():
+            rollout = agreement_flow_rollout(flow, pair_source.detach(), pair_classes, num_steps=4)
+            semantic_loss = F.cross_entropy(model.fc1(rollout), pair_classes)
     assert torch.isfinite(fm_loss) and torch.isfinite(semantic_loss)
     return fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes
 
@@ -289,6 +358,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=1341)
     parser.add_argument("--variant", choices=["flow_a", "flow_b"], default="flow_a")
+    parser.add_argument("--weight-mode", choices=["js_product", "q", "mean_qs", "s"], default="js_product")
+    parser.add_argument("--scene-shift", action="store_true")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.mode == "self-test":
@@ -309,16 +380,18 @@ def main():
         assert torch.allclose(r.sum(1), torch.ones(nt), atol=1e-6)
         assert agreement.min() >= 0 and agreement.max() <= 1
         assert margin.min() >= 0 and margin.max() <= 1
-        flow = AgreementFlowMLP(dim)
+        flow = ConditionalFlowMLP(dim, classes, hidden_dim=dim)
         pair_source, pair_target = source[:8].clone().requires_grad_(), target[:8].clone()
-        fm_loss, _ = agreement_flow_matching_loss(flow, pair_source, pair_target)
-        rollout = agreement_flow_rollout(flow, pair_source, num_steps=4)
-        semantic_loss = rollout.square().mean()
+        pair_classes = labels[:8]
+        fm_loss, _ = agreement_flow_matching_loss(flow, pair_source, pair_target, pair_classes)
+        rollout = agreement_flow_rollout(flow, pair_source, pair_classes, num_steps=4)
+        semantic_loss = rollout.detach().square().mean()
+        fm_grad = torch.autograd.grad(fm_loss, tuple(flow.parameters()), retain_graph=True)
+        assert sum(float(g.norm()) for g in fm_grad) > 0
         fm_loss.backward(retain_graph=True)
         assert pair_source.grad is None, "FM must not update source/backbone features"
         flow.zero_grad(set_to_none=True)
-        semantic_loss.backward()
-        assert pair_source.grad is not None, "Flow-A semantic loss must reach source/backbone features"
+        assert not semantic_loss.requires_grad
         print(json.dumps({"self_test": "ok", "classes_with_ot": sorted(ot), "r_row_sum_max_error": float((r.sum(1)-1).abs().max())}))
         return
 
@@ -340,6 +413,11 @@ def main():
         cache = shared_cache
 
     cached = np.load(cache)
+    source_flat = cached["s"].reshape(-1, cached["s"].shape[-1]).astype(np.float32)
+    target_flat = cached["t"].reshape(-1, cached["t"].shape[-1]).astype(np.float32)
+    scene_stats = tuple(torch.as_tensor(value)[None, :, None, None].cuda() for value in (
+        source_flat.mean(0), source_flat.std(0), target_flat.mean(0), target_flat.std(0)
+    ))
 
     def paired_ilda(source, target, components, radius):
         assert components == 2 and radius == 0.009
@@ -357,25 +435,43 @@ def main():
         '    print("Training...")',
         '    audit_split(trainX, trainY, testX, testY, feature_encoder)\n    print("Training...")',
     )
-    start = code.index("            # 0\n")
-    end = code.index("            # Update parameters", start)
     code = code.replace("feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()",
-                        "feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()\n    flow = AgreementFlowMLP(288).cuda()")
+                        "feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()\n    flow = ConditionalFlowMLP(288, CLASS_NUM, hidden_dim=288).cuda()")
     code = code.replace("{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},",
                         "{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},\n            {'params': flow.parameters(), 'lr': LEARNING_RATE},")
     code = code.replace("feature_encoder.train()", "feature_encoder.train()\n        flow.train()")
-    replacement = '''            if i == 1:
-                prototypes, valid_classes = global_source_prototypes(
-                    feature_encoder, trainX, trainY, target_data.cuda())
+    start = code.index("            # 0\n")
+    end = code.index("            # Update parameters", start)
+    scene_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
+            diagnostics.begin(epoch)
             (source_features, source1, _, source_outputs, source_out,
+             target_features, _, target1, target_outputs, target_out) = feature_encoder(
+                    source_data.cuda(), target_data.cuda())
+            (shifted_features, _, _, shifted_outputs, _,
+             target_features_ss, _, _, target_outputs_ss, _) = feature_encoder(
+                    shifted_data, target_data.cuda())
+            cls_loss = crossEntropy(source_outputs, source_label.cuda()) + crossEntropy(shifted_outputs, source_label.cuda())
+            diagnostics.observe_scene_shift(source_outputs.detach(), shifted_outputs.detach(), source_label.cuda(),
+                                            source_features.detach(), shifted_features.detach(), target_features_ss.detach())
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+                feature_encoder, flow, shifted_features, target_features_ss, target_outputs_ss,
+                source_label.cuda(), target_label, prototypes, valid_classes,
+                epoch, diagnostics, flow_variant, "q")
+'''
+    base_forward = '''            (source_features, source1, _, source_outputs, source_out,
              target_features, _, target1, target_outputs, target_out) = feature_encoder(
                     source_data.cuda(), target_data.cuda())
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
             fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
                 feature_encoder, flow, source_features, target_features, target_outputs,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant)
-            loss = cls_loss + fm_loss + 0.1 * semantic_loss
+                epoch, diagnostics, flow_variant, weight_mode)
+'''
+    replacement = '''            if i == 1:
+                prototypes, valid_classes = global_source_prototypes(
+                    feature_encoder, trainX, trainY, target_data.cuda(), scene_stats if scene_shift_enabled else None)
+''' + (scene_forward if args.scene_shift else base_forward) + '''
+            loss = cls_loss + fm_loss
             diagnostics.observe_losses(cls_loss, fm_loss, semantic_loss, flow_stats,
                                        rollout, pair_target, pair_classes, feature_encoder.fc1)
             # Values retained only for the unchanged official progress formatter.
@@ -399,6 +495,8 @@ def main():
                 value.detach().cpu().numpy().tobytes() for value in model.state_dict().values()
             )).hexdigest(),
             "seed": args.seed, "epochs": args.epochs, "variant": args.variant,
+            "scene_shift": args.scene_shift, "scene_shift_alpha": 0.8 if args.scene_shift else 0.0,
+            "target_weight": "q" if args.scene_shift else args.weight_mode,
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
             "official_file_sha256": hashlib.sha256(original.encode()).hexdigest(),
@@ -430,7 +528,11 @@ def main():
         "adaptation": adaptation,
         "diagnostics": diagnostics,
         "flow_variant": args.variant,
-        "AgreementFlowMLP": AgreementFlowMLP,
+        "weight_mode": args.weight_mode,
+        "scene_stats": scene_stats,
+        "scene_shift_batch": scene_shift_batch,
+        "scene_shift_enabled": args.scene_shift,
+        "ConditionalFlowMLP": ConditionalFlowMLP,
     }
     (out / "executed.py").write_text(code)
     os.chdir(LEGACY)

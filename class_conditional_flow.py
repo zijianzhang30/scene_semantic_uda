@@ -8,6 +8,7 @@ Run it directly to execute the synthetic smoke test at the bottom.
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
+import math
 
 import torch
 from torch import Tensor, nn
@@ -32,30 +33,38 @@ class AgreementFlowMLP(nn.Module):
         return self.net(torch.cat((features, time.to(features.dtype)), dim=1))
 
 
-def agreement_flow_matching_loss(flow: AgreementFlowMLP, source: Tensor, target: Tensor):
+def agreement_flow_matching_loss(flow: nn.Module, source: Tensor, target: Tensor,
+                                 class_labels: Tensor):
     """FM on detached OT pairs; returns loss and detached diagnostics."""
     source, target = source.detach(), target.detach()
     time = torch.rand(len(source), device=source.device)
     state = (1.0 - time[:, None]) * source + time[:, None] * target
-    velocity_target = target - source
-    velocity_pred = flow(state, time)
-    loss = F.mse_loss(velocity_pred, velocity_target)
-    cosine = F.cosine_similarity(velocity_pred, velocity_target, dim=1).mean()
+    original_velocity = target - source
+    scale = math.sqrt(source.shape[1])
+    velocity_target = original_velocity / scale
+    velocity_pred = flow(state, time, class_labels)
+    # Preserve the original-velocity MSE scale after dividing velocity by sqrt(d).
+    loss = source.shape[1] * F.mse_loss(velocity_pred, velocity_target)
+    cosine = F.cosine_similarity(velocity_pred, original_velocity, dim=1).mean()
     return loss, {
-        "pair_distance": velocity_target.norm(dim=1).mean().detach(),
-        "predicted_velocity_norm": velocity_pred.norm(dim=1).mean().detach(),
-        "target_velocity_norm": velocity_target.norm(dim=1).mean().detach(),
+        "pair_distance": original_velocity.norm(dim=1).mean().detach(),
+        "original_target_velocity_norm": original_velocity.norm(dim=1).mean().detach(),
+        "normalized_target_velocity_norm": velocity_target.norm(dim=1).mean().detach(),
+        "predicted_normalized_velocity_norm": velocity_pred.norm(dim=1).mean().detach(),
+        "restored_predicted_velocity_norm": (velocity_pred.norm(dim=1) * scale).mean().detach(),
         "velocity_cosine": cosine.detach(),
     }
 
 
-def agreement_flow_rollout(flow: AgreementFlowMLP, source: Tensor, num_steps: int = 4) -> Tensor:
+def agreement_flow_rollout(flow: nn.Module, source: Tensor, class_labels: Tensor,
+                           num_steps: int = 4) -> Tensor:
     """Fixed-step differentiable Euler rollout from t=0 to t=1."""
     state = source
     dt = 1.0 / num_steps
+    scale = math.sqrt(source.shape[1])
     for step in range(num_steps):
         time = state.new_full((len(state),), step / num_steps)
-        state = state + dt * flow(state, time)
+        state = state + dt * scale * flow(state, time, class_labels)
     return state
 
 
