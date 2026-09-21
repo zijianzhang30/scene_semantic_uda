@@ -21,6 +21,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 import torch
+from torch import nn
 import torch.nn.functional as F
 
 
@@ -189,6 +190,18 @@ class EpochDiagnostics:
         self.true6_hist += torch.bincount(q.argmax(1)[true6].cpu(), minlength=NUM_CLASSES)
 
     @torch.no_grad()
+    def observe_q_only(self, q, labels):
+        """Record classifier-view target diagnostics without constructing OT."""
+        labels = labels.to(q.device)
+        self.n += len(labels)
+        q_pred = q.argmax(1)
+        self.q_correct += int((q_pred == labels).sum())
+        true6 = labels == 6
+        self.true6_n += int(true6.sum())
+        self.q6_correct += int((q_pred[true6] == 6).sum())
+        self.true6_hist += torch.bincount(q_pred[true6].cpu(), minlength=NUM_CLASSES)
+
+    @torch.no_grad()
     def observe_scene_shift(self, source_logits, shifted_logits, labels, source, shifted, target):
         self.source_correct += int((source_logits.argmax(1) == labels).sum())
         self.shifted_source_correct += int((shifted_logits.argmax(1) == labels).sum())
@@ -273,6 +286,9 @@ class EpochDiagnostics:
             "source_accuracy": self.source_correct / max(self.source_n, 1),
             "shifted_source_accuracy": self.shifted_source_correct / max(self.source_n, 1),
             "target_q_class6_accuracy": self.q6_correct / max(self.true6_n, 1),
+            "target_q_true_class6_to_class5": (
+                int(self.true6_hist[5]) / max(self.true6_n, 1)
+            ),
             "target_s_ss_class6_accuracy": self.s6_correct / max(self.true6_n, 1),
             "true_class6_q_prediction_histogram": self.true6_hist.tolist(),
             "source_target_mean_feature_distance": self.source_target_distance_sum / max(self.batches, 1),
@@ -285,6 +301,19 @@ class EpochDiagnostics:
 def scene_shift_batch(x, source_mean, source_std, target_mean, target_std, alpha=0.8):
     mapped = (x - source_mean) / (source_std + 1e-5) * target_std + target_mean
     return (1.0 - alpha) * x + alpha * mapped
+
+
+def forward_without_bn_update(model, source, target):
+    """Second SceneShift view: retain gradients but do not update BN buffers again."""
+    batch_norms = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    states = [m.training for m in batch_norms]
+    try:
+        for module in batch_norms:
+            module.eval()
+        return model(source, target)
+    finally:
+        for module, training in zip(batch_norms, states):
+            module.train(training)
 
 
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
@@ -360,8 +389,12 @@ def main():
     parser.add_argument("--variant", choices=["flow_a", "flow_b"], default="flow_a")
     parser.add_argument("--weight-mode", choices=["js_product", "q", "mean_qs", "s"], default="js_product")
     parser.add_argument("--scene-shift", action="store_true")
+    parser.add_argument("--scene-shift-only", action="store_true",
+                        help="Fair SceneShift control: averaged source/shifted-source CE only")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
+    if args.scene_shift_only and not args.scene_shift:
+        parser.error("--scene-shift-only requires --scene-shift")
     if args.mode == "self-test":
         torch.manual_seed(args.seed)
         ns, nt, dim, classes = 19, 13, 11, NUM_CLASSES
@@ -448,9 +481,9 @@ def main():
              target_features, _, target1, target_outputs, target_out) = feature_encoder(
                     source_data.cuda(), target_data.cuda())
             (shifted_features, _, _, shifted_outputs, _,
-             target_features_ss, _, _, target_outputs_ss, _) = feature_encoder(
+             target_features_ss, _, _, target_outputs_ss, _) = forward_without_bn_update(feature_encoder,
                     shifted_data, target_data.cuda())
-            cls_loss = crossEntropy(source_outputs, source_label.cuda()) + crossEntropy(shifted_outputs, source_label.cuda())
+            cls_loss = 0.5 * (crossEntropy(source_outputs, source_label.cuda()) + crossEntropy(shifted_outputs, source_label.cuda()))
             diagnostics.observe_scene_shift(source_outputs.detach(), shifted_outputs.detach(), source_label.cuda(),
                                             source_features.detach(), shifted_features.detach(), target_features_ss.detach())
             fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
@@ -467,10 +500,35 @@ def main():
                 source_label.cuda(), target_label, prototypes, valid_classes,
                 epoch, diagnostics, flow_variant, weight_mode)
 '''
-    replacement = '''            if i == 1:
+    scene_only_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
+            diagnostics.begin(epoch)
+            (source_features, source1, _, source_outputs, source_out,
+             target_features, _, target1, target_outputs, target_out) = feature_encoder(
+                    source_data.cuda(), target_data.cuda())
+            (shifted_features, _, _, shifted_outputs, _,
+             target_features_ss, _, _, target_outputs_ss, _) = forward_without_bn_update(
+                    feature_encoder, shifted_data, target_data.cuda())
+            cls_loss = 0.5 * (crossEntropy(source_outputs, source_label.cuda()) +
+                              crossEntropy(shifted_outputs, source_label.cuda()))
+            with torch.no_grad():
+                q = target_outputs_ss.detach().softmax(1)
+                diagnostics.observe_q_only(q, target_label.cuda())
+                diagnostics.observe_scene_shift(
+                    source_outputs.detach(), shifted_outputs.detach(), source_label.cuda(),
+                    source_features.detach(), shifted_features.detach(), target_features_ss.detach())
+            fm_loss = cls_loss.detach() * 0.0
+            semantic_loss = cls_loss.detach() * 0.0
+            flow_stats = None
+            rollout = shifted_features.detach()
+            pair_target = target_features_ss.detach()
+            pair_classes = source_label.cuda()
+            loss = cls_loss
+'''
+    prototype_prefix = '' if args.scene_shift_only else '''            if i == 1:
                 prototypes, valid_classes = global_source_prototypes(
                     feature_encoder, trainX, trainY, target_data.cuda(), scene_stats if scene_shift_enabled else None)
-''' + (scene_forward if args.scene_shift else base_forward) + '''
+'''
+    replacement = prototype_prefix + (scene_only_forward if args.scene_shift_only else (scene_forward if args.scene_shift else base_forward)) + '''
             loss = cls_loss + fm_loss
             diagnostics.observe_losses(cls_loss, fm_loss, semantic_loss, flow_stats,
                                        rollout, pair_target, pair_classes, feature_encoder.fc1)
@@ -496,7 +554,8 @@ def main():
             )).hexdigest(),
             "seed": args.seed, "epochs": args.epochs, "variant": args.variant,
             "scene_shift": args.scene_shift, "scene_shift_alpha": 0.8 if args.scene_shift else 0.0,
-            "target_weight": "q" if args.scene_shift else args.weight_mode,
+            "scene_shift_only": args.scene_shift_only,
+            "target_weight": None if args.scene_shift_only else ("q" if args.scene_shift else args.weight_mode),
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
             "official_file_sha256": hashlib.sha256(original.encode()).hexdigest(),
@@ -531,13 +590,21 @@ def main():
         "weight_mode": args.weight_mode,
         "scene_stats": scene_stats,
         "scene_shift_batch": scene_shift_batch,
+        "forward_without_bn_update": forward_without_bn_update,
         "scene_shift_enabled": args.scene_shift,
+        "scene_shift_only": args.scene_shift_only,
         "ConditionalFlowMLP": ConditionalFlowMLP,
     }
     (out / "executed.py").write_text(code)
     os.chdir(LEGACY)
     exec(compile(code, str(official_path), "exec"), namespace)
-    result = {"epoch": args.epochs, **history[-1], "selection": f"fixed_epoch{args.epochs}"}
+    best_diagnostic = max(history, key=lambda row: row["oa"])
+    result = {"epoch": args.epochs, **history[-1], "selection": f"fixed_epoch{args.epochs}",
+              "method": "scene_shift_only" if args.scene_shift_only else "flow_transport",
+              "scene_shift_only": args.scene_shift_only,
+              "diagnostic_best_oa": best_diagnostic["oa"],
+              "diagnostic_best_epoch": best_diagnostic["epoch"],
+              "epoch100_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"]}
     result["gpu_max_allocated"] = torch.cuda.max_memory_allocated()
     torch.save({"model": namespace["feature_encoder"].state_dict(), "flow": namespace["flow"].state_dict(), "metrics": result}, out / f"epoch{args.epochs}.pth")
     (out / "results.json").write_text(json.dumps(result, indent=2))
