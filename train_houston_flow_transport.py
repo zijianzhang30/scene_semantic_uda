@@ -102,6 +102,8 @@ def classwise_sinkhorn_ot_weighted(
     reg: float = 0.05,
     iterations: int = 100,
     target_mask: torch.Tensor | None = None,
+    semantic_probabilities: torch.Tensor | None = None,
+    lambda_sem: float = 0.0,
 ) -> Dict[int, Dict[str, torch.Tensor]]:
     """Class-wise cosine OT with uniform source and normalized a_j r_j^c target mass."""
     result: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -115,7 +117,13 @@ def classwise_sinkhorn_ot_weighted(
         if raw_target_mass.sum() < EPS:  # Numerical guard, not a reliability gate.
             continue
         source = source_features[source_mask]
-        cost = 1.0 - F.normalize(source, dim=1) @ F.normalize(target_features, dim=1).t()
+        feature_cost = 1.0 - F.normalize(source, dim=1) @ F.normalize(target_features, dim=1).t()
+        if semantic_probabilities is not None and lambda_sem:
+            semantic_cost = -semantic_probabilities[:, class_id].clamp_min(EPS).log()
+            cost = feature_cost + lambda_sem * semantic_cost[None, :]
+        else:
+            semantic_cost = torch.zeros(len(target_features), device=target_features.device, dtype=target_features.dtype)
+            cost = feature_cost
         source_mass = source.new_full((len(source),), 1.0 / len(source))
         target_mass = raw_target_mass / raw_target_mass.sum().clamp_min(EPS)
         kernel = torch.exp(-cost / reg).clamp_min(torch.finfo(cost.dtype).tiny)
@@ -130,6 +138,8 @@ def classwise_sinkhorn_ot_weighted(
             "source_indices": source_mask.nonzero(as_tuple=False).flatten(),
             "target_indices": torch.arange(len(target_features), device=target_features.device),
             "cost": cost,
+            "feature_cost": feature_cost,
+            "semantic_cost": semantic_cost,
             "raw_target_mass": raw_target_mass,
         }
     return result
@@ -152,6 +162,8 @@ class EpochDiagnostics:
         self.mass = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.pairs = torch.zeros(NUM_CLASSES, dtype=torch.long)
         self.cost_sum = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+        self.feature_cost_sum = torch.zeros(NUM_CLASSES, dtype=torch.float64)
+        self.semantic_cost_sum = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.cost_weight = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.source_loss_sum = self.fm_loss_sum = self.semantic_loss_sum = 0.0
         self.intra_loss_sum = 0.0
@@ -230,6 +242,8 @@ class EpochDiagnostics:
             coupling = item["coupling"]
             weight = float(coupling.sum())
             self.cost_sum[class_id] += float((coupling * item["cost"]).sum())
+            self.feature_cost_sum[class_id] += float((coupling * item["feature_cost"]).sum())
+            self.semantic_cost_sum[class_id] += float((coupling.sum(0) * item["semantic_cost"]).sum())
             self.cost_weight[class_id] += weight
 
     def observe_losses(self, source_loss, fm_loss, semantic_loss, flow_stats, rollout, target, classes, classifier, intra_loss=0.0):
@@ -275,6 +289,8 @@ class EpochDiagnostics:
             "per_class_target_mass_sum": self.mass.tolist(),
             "per_class_ot_pair_count": self.pairs.tolist(),
             "per_class_average_ot_cost": costs,
+            "per_class_mean_feature_cost": [float(self.feature_cost_sum[c] / self.cost_weight[c]) if self.cost_weight[c] else None for c in range(NUM_CLASSES)],
+            "per_class_mean_semantic_cost": [float(self.semantic_cost_sum[c] / self.cost_weight[c]) if self.cost_weight[c] else None for c in range(NUM_CLASSES)],
             "source_loss": self.source_loss_sum / max(self.batches, 1),
             "fm_loss": self.fm_loss_sum / max(self.batches, 1),
             "semantic_loss": self.semantic_loss_sum / max(self.batches, 1),
@@ -354,7 +370,7 @@ def unreliable_intra_target_loss(features, pseudo_labels, unreliable_mask, tempe
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
                target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant,
                weight_mode="js_product", fm_backprop_source=False, reliability_routing=False,
-               routing_assignment="hard"):
+               routing_assignment="hard", semantic_aware_ot=False, lambda_sem=0.1):
     diagnostics.begin(epoch)
     with torch.no_grad():
         if reliability_routing:
@@ -394,6 +410,8 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
         ot = classwise_sinkhorn_ot_weighted(
             source_features.detach(), source_labels, target_features.detach(), ot_membership, ot_weight,
             NUM_CLASSES, reg=0.05, iterations=100, target_mask=reliable,
+            semantic_probabilities=q if semantic_aware_ot else None,
+            lambda_sem=lambda_sem if semantic_aware_ot else 0.0,
         )
         assert all(torch.isfinite(item["coupling"]).all() for item in ot.values())
     pair_source, pair_target, pair_classes = sample_ot_pairs(
@@ -466,6 +484,8 @@ def main():
     parser.add_argument("--lambda-intra", type=float, default=0.05)
     parser.add_argument("--routing-assignment", choices=["hard", "soft"], default="hard",
                         help="Hard agreed-class mass or legacy soft mass within reliable targets")
+    parser.add_argument("--semantic-aware-ot", action="store_true")
+    parser.add_argument("--lambda-sem", type=float, default=0.1)
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.scene_shift_only and not args.scene_shift:
@@ -674,6 +694,8 @@ def main():
             "prototype_mode": "batch_same_forward" if args.reliability_routing else "epoch_global",
             "lambda_intra": args.lambda_intra,
             "routing_assignment": args.routing_assignment,
+            "semantic_aware_ot": args.semantic_aware_ot,
+            "lambda_sem": args.lambda_sem,
             "target_weight": None if args.scene_shift_only else (
                 "reliable_hard_uniform" if args.reliability_routing and args.routing_assignment == "hard" else
                 ("q" if args.scene_shift else args.weight_mode)),
@@ -705,7 +727,7 @@ def main():
         "audit_split": audit_split,
         "audit_epoch": audit_epoch,
         "global_source_prototypes": global_source_prototypes,
-        "adaptation": lambda *a, **kw: adaptation(*a, **kw, routing_assignment=args.routing_assignment),
+        "adaptation": lambda *a, **kw: adaptation(*a, **kw, routing_assignment=args.routing_assignment, semantic_aware_ot=args.semantic_aware_ot, lambda_sem=args.lambda_sem),
         "diagnostics": diagnostics,
         "flow_variant": args.variant,
         "weight_mode": args.weight_mode,
