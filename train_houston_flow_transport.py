@@ -101,14 +101,17 @@ def classwise_sinkhorn_ot_weighted(
     num_classes: int,
     reg: float = 0.05,
     iterations: int = 100,
+    target_mask: torch.Tensor | None = None,
 ) -> Dict[int, Dict[str, torch.Tensor]]:
     """Class-wise cosine OT with uniform source and normalized a_j r_j^c target mass."""
     result: Dict[int, Dict[str, torch.Tensor]] = {}
+    if target_mask is None:
+        target_mask = torch.ones(len(target_features), dtype=torch.bool, device=target_features.device)
     for class_id in range(num_classes):
         source_mask = source_labels == class_id
         if not source_mask.any():
             continue
-        raw_target_mass = agreement * soft_membership[:, class_id]
+        raw_target_mass = (agreement * soft_membership[:, class_id]).masked_fill(~target_mask, 0.0)
         if raw_target_mass.sum() < EPS:  # Numerical guard, not a reliability gate.
             continue
         source = source_features[source_mask]
@@ -151,6 +154,12 @@ class EpochDiagnostics:
         self.cost_sum = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.cost_weight = torch.zeros(NUM_CLASSES, dtype=torch.float64)
         self.source_loss_sum = self.fm_loss_sum = self.semantic_loss_sum = 0.0
+        self.intra_loss_sum = 0.0
+        self.reliable_n = 0
+        self.reliable_class = torch.zeros(NUM_CLASSES, dtype=torch.long)
+        self.reliable_correct = self.reliable_total = 0
+        self.prototype_source_counts = torch.zeros(NUM_CLASSES, dtype=torch.long)
+        self.prototype_missing_batches = torch.zeros(NUM_CLASSES, dtype=torch.long)
         self.pair_distance_sum = self.pred_velocity_sum = self.target_velocity_sum = 0.0
         self.normalized_target_velocity_sum = self.restored_pred_velocity_sum = 0.0
         self.velocity_cosine_sum = self.rollout_distance_sum = self.transport_correct = 0.0
@@ -223,10 +232,11 @@ class EpochDiagnostics:
             self.cost_sum[class_id] += float((coupling * item["cost"]).sum())
             self.cost_weight[class_id] += weight
 
-    def observe_losses(self, source_loss, fm_loss, semantic_loss, flow_stats, rollout, target, classes, classifier):
+    def observe_losses(self, source_loss, fm_loss, semantic_loss, flow_stats, rollout, target, classes, classifier, intra_loss=0.0):
         self.source_loss_sum += float(source_loss.detach())
         self.fm_loss_sum += float(fm_loss.detach())
         self.semantic_loss_sum += float(semantic_loss.detach())
+        self.intra_loss_sum += float(intra_loss.detach() if torch.is_tensor(intra_loss) else intra_loss)
         if flow_stats:
             self.pair_distance_sum += float(flow_stats["pair_distance"])
             self.pred_velocity_sum += float(flow_stats["predicted_normalized_velocity_norm"])
@@ -268,6 +278,12 @@ class EpochDiagnostics:
             "source_loss": self.source_loss_sum / max(self.batches, 1),
             "fm_loss": self.fm_loss_sum / max(self.batches, 1),
             "semantic_loss": self.semantic_loss_sum / max(self.batches, 1),
+            "intra_loss": self.intra_loss_sum / max(self.batches, 1),
+            "reliable_ratio": self.reliable_n / max(self.n, 1),
+            "per_class_reliable_count": self.reliable_class.tolist(),
+            "reliable_purity": self.reliable_correct / max(self.reliable_total, 1),
+            "prototype_source_counts": self.prototype_source_counts.tolist(),
+            "prototype_missing_batch_fraction": (self.prototype_missing_batches.double() / max(self.batches, 1)).tolist(),
             "mean_pair_distance": self.pair_distance_sum / max(self.batches, 1),
             "mean_original_target_velocity_norm": self.target_velocity_sum / max(self.batches, 1),
             "mean_normalized_target_velocity_norm": self.normalized_target_velocity_sum / max(self.batches, 1),
@@ -318,17 +334,44 @@ def forward_without_bn_update(model, source, target):
             module.train(training)
 
 
+def unreliable_intra_target_loss(features, pseudo_labels, unreliable_mask, temperature=0.2):
+    """Small pseudo-class InfoNCE loss on unreliable target features only."""
+    if int(unreliable_mask.sum()) < 2:
+        return features.sum() * 0.0
+    z = F.normalize(features[unreliable_mask], dim=1)
+    y = pseudo_labels[unreliable_mask]
+    logits = (z @ z.t()) / temperature
+    eye = torch.eye(len(z), dtype=torch.bool, device=z.device)
+    logits = logits.masked_fill(eye, -torch.finfo(logits.dtype).max)
+    positive = (y[:, None] == y[None, :]) & ~eye
+    valid = positive.any(1)
+    if not valid.any():
+        return features.sum() * 0.0
+    log_prob = logits.log_softmax(1)
+    return -(log_prob[valid] * positive[valid].float()).sum(1).div(positive[valid].sum(1)).mean()
+
+
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
                target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant,
-               weight_mode="js_product", fm_backprop_source=False):
+               weight_mode="js_product", fm_backprop_source=False, reliability_routing=False):
     diagnostics.begin(epoch)
     with torch.no_grad():
+        if reliability_routing:
+            # Same forward, context, model state and source space as OT/Flow.
+            prototypes, valid_classes = compute_source_prototypes(
+                source_features.detach(), source_labels, NUM_CLASSES)
+            counts = torch.bincount(source_labels, minlength=NUM_CLASSES).cpu()
+            diagnostics.prototype_source_counts += counts
+            diagnostics.prototype_missing_batches += counts.eq(0).long()
         q = target_logits.detach().softmax(1)
         s, r, agreement = agreement_membership(
             target_features.detach(), q, prototypes, valid_classes, prototype_temperature=1.0
         )
         top2 = r.topk(2, dim=1).values
         margin = top2[:, 0] - top2[:, 1]
+        reliable = q.argmax(1).eq(s.argmax(1)) if reliability_routing else torch.ones(len(q), dtype=torch.bool, device=q.device)
+        if reliability_routing:
+            reliable &= valid_classes[q.argmax(1)]
         if weight_mode == "q":
             ot_membership, ot_weight = q, torch.ones_like(agreement)
         elif weight_mode == "mean_qs":
@@ -338,9 +381,13 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
         else:
             ot_membership, ot_weight = r, agreement
         diagnostics.observe_target(q, s, ot_membership, ot_weight, margin, ot_weight, target_labels)
+        diagnostics.reliable_n += int(reliable.sum())
+        diagnostics.reliable_class += torch.bincount(q.argmax(1)[reliable].cpu(), minlength=NUM_CLASSES)
+        diagnostics.reliable_total += int(reliable.sum())
+        diagnostics.reliable_correct += int((q.argmax(1)[reliable] == target_labels.to(q.device)[reliable]).sum())
         ot = classwise_sinkhorn_ot_weighted(
             source_features.detach(), source_labels, target_features.detach(), ot_membership, ot_weight,
-            NUM_CLASSES, reg=0.05, iterations=100,
+            NUM_CLASSES, reg=0.05, iterations=100, target_mask=reliable,
         )
         assert all(torch.isfinite(item["coupling"]).all() for item in ot.values())
     pair_source, pair_target, pair_classes = sample_ot_pairs(
@@ -348,6 +395,7 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
     )
     diagnostics.observe_ot(ot, pair_classes)
     fm_loss = source_features.sum() * 0.0
+    intra_loss = unreliable_intra_target_loss(target_features, q.argmax(1), ~reliable) if reliability_routing else source_features.sum() * 0.0
     semantic_loss = source_features.sum() * 0.0
     rollout = pair_source
     flow_stats = None
@@ -371,7 +419,7 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
             rollout = agreement_flow_rollout(flow, pair_source.detach(), pair_classes, num_steps=4)
             semantic_loss = F.cross_entropy(model.fc1(rollout), pair_classes)
     assert torch.isfinite(fm_loss) and torch.isfinite(semantic_loss)
-    return fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes
+    return fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes, intra_loss
 
 
 def metrics_from_predictions(predictions, labels):
@@ -407,6 +455,9 @@ def main():
                               "original source/target forward for q-only OT and Flow"))
     parser.add_argument("--fm-backprop-source", action="store_true",
                         help="Allow FM loss to update the backbone through source OT features")
+    parser.add_argument("--reliability-routing", action="store_true",
+                        help="Route only q/prototype-agreeing targets to OT; train unreliable-target intra loss")
+    parser.add_argument("--lambda-intra", type=float, default=0.05)
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.scene_shift_only and not args.scene_shift:
@@ -506,10 +557,10 @@ def main():
             cls_loss = 0.5 * (crossEntropy(source_outputs, source_label.cuda()) + crossEntropy(shifted_outputs, source_label.cuda()))
             diagnostics.observe_scene_shift(source_outputs.detach(), shifted_outputs.detach(), source_label.cuda(),
                                             source_features.detach(), shifted_features.detach(), target_features_ss.detach())
-            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes, intra_loss = adaptation(
                 feature_encoder, flow, shifted_features, target_features_ss, target_outputs_ss,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant, "q", fm_backprop_source)
+                epoch, diagnostics, flow_variant, "q", fm_backprop_source, reliability_routing)
 '''
     scene_aux_original_flow_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
             diagnostics.begin(epoch)
@@ -524,19 +575,19 @@ def main():
                                             source_features.detach(), shifted_features.detach(), target_features.detach())
             # The shifted view is auxiliary classification supervision only.  OT and
             # Flow use the original source/target pair from the first forward.
-            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes, intra_loss = adaptation(
                 feature_encoder, flow, source_features, target_features, target_outputs,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant, "q", fm_backprop_source)
+                epoch, diagnostics, flow_variant, "q", fm_backprop_source, reliability_routing)
 '''
     base_forward = '''            (source_features, source1, _, source_outputs, source_out,
              target_features, _, target1, target_outputs, target_out) = feature_encoder(
                     source_data.cuda(), target_data.cuda())
             cls_loss = crossEntropy(source_outputs, source_label.cuda())
-            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes, intra_loss = adaptation(
                 feature_encoder, flow, source_features, target_features, target_outputs,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant, weight_mode, fm_backprop_source)
+                epoch, diagnostics, flow_variant, weight_mode, fm_backprop_source, reliability_routing)
 '''
     scene_only_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
             diagnostics.begin(epoch)
@@ -556,6 +607,7 @@ def main():
                     source_features.detach(), shifted_features.detach(), target_features_ss.detach())
             fm_loss = cls_loss.detach() * 0.0
             semantic_loss = cls_loss.detach() * 0.0
+            intra_loss = cls_loss.detach() * 0.0
             flow_stats = None
             rollout = shifted_features.detach()
             pair_target = target_features_ss.detach()
@@ -563,9 +615,16 @@ def main():
             loss = cls_loss
 '''
     prototype_prefix = '' if args.scene_shift_only else '''            if i == 1:
+                # Auxiliary original-source OT/Flow must use prototypes in the
+                # same original feature space; the fair shifted-source branch
+                # intentionally keeps shifted prototypes.
+                prototype_shift_stats = (
+                    scene_stats if scene_shift_enabled and not scene_shift_aux_original_flow else None)
                 prototypes, valid_classes = global_source_prototypes(
-                    feature_encoder, trainX, trainY, target_data.cuda(), scene_stats if scene_shift_enabled else None)
+                    feature_encoder, trainX, trainY, target_data.cuda(), prototype_shift_stats)
 '''
+    if args.reliability_routing and not args.scene_shift_only:
+        prototype_prefix = '            prototypes, valid_classes = None, None\n'
     if args.scene_shift_only:
         selected_forward = scene_only_forward
     elif args.scene_shift_aux_original_flow:
@@ -575,9 +634,9 @@ def main():
     else:
         selected_forward = base_forward
     replacement = prototype_prefix + selected_forward + '''
-            loss = cls_loss + fm_loss
+            loss = cls_loss + fm_loss + lambda_intra * intra_loss
             diagnostics.observe_losses(cls_loss, fm_loss, semantic_loss, flow_stats,
-                                       rollout, pair_target, pair_classes, feature_encoder.fc1)
+                                       rollout, pair_target, pair_classes, feature_encoder.fc1, intra_loss)
             # Values retained only for the unchanged official progress formatter.
             lmmd_loss = contrastive_loss_s = contrastive_loss_t = loss.detach() * 0
 
@@ -603,6 +662,9 @@ def main():
             "scene_shift_only": args.scene_shift_only,
             "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
             "fm_backprop_source": args.fm_backprop_source,
+            "reliability_routing": args.reliability_routing,
+            "prototype_mode": "batch_same_forward" if args.reliability_routing else "epoch_global",
+            "lambda_intra": args.lambda_intra,
             "target_weight": None if args.scene_shift_only else ("q" if args.scene_shift else args.weight_mode),
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
@@ -641,7 +703,10 @@ def main():
         "forward_without_bn_update": forward_without_bn_update,
         "scene_shift_enabled": args.scene_shift,
         "scene_shift_only": args.scene_shift_only,
+        "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
         "fm_backprop_source": args.fm_backprop_source,
+        "reliability_routing": args.reliability_routing,
+        "lambda_intra": args.lambda_intra,
         "ConditionalFlowMLP": ConditionalFlowMLP,
     }
     (out / "executed.py").write_text(code)
@@ -656,6 +721,8 @@ def main():
               "scene_shift_only": args.scene_shift_only,
               "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
               "fm_backprop_source": args.fm_backprop_source,
+              "reliability_routing": args.reliability_routing,
+              "lambda_intra": args.lambda_intra,
               "diagnostic_best_oa": best_diagnostic["oa"],
               "diagnostic_best_epoch": best_diagnostic["epoch"],
               "epoch100_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"]}
