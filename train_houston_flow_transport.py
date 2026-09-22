@@ -353,7 +353,8 @@ def unreliable_intra_target_loss(features, pseudo_labels, unreliable_mask, tempe
 
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
                target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant,
-               weight_mode="js_product", fm_backprop_source=False, reliability_routing=False):
+               weight_mode="js_product", fm_backprop_source=False, reliability_routing=False,
+               routing_assignment="hard"):
     diagnostics.begin(epoch)
     with torch.no_grad():
         if reliability_routing:
@@ -372,7 +373,12 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
         reliable = q.argmax(1).eq(s.argmax(1)) if reliability_routing else torch.ones(len(q), dtype=torch.bool, device=q.device)
         if reliability_routing:
             reliable &= valid_classes[q.argmax(1)]
-        if weight_mode == "q":
+        if reliability_routing and routing_assignment == "hard":
+            # One target belongs to exactly its agreed class, or to no OT.
+            # Unit mass gives a uniform marginal within each nonempty class.
+            ot_membership = F.one_hot(q.argmax(1), NUM_CLASSES).to(q.dtype)
+            ot_weight = reliable.to(q.dtype)
+        elif weight_mode == "q":
             ot_membership, ot_weight = q, torch.ones_like(agreement)
         elif weight_mode == "mean_qs":
             ot_membership, ot_weight = 0.5 * (q + s), torch.ones_like(agreement)
@@ -458,6 +464,8 @@ def main():
     parser.add_argument("--reliability-routing", action="store_true",
                         help="Route only q/prototype-agreeing targets to OT; train unreliable-target intra loss")
     parser.add_argument("--lambda-intra", type=float, default=0.05)
+    parser.add_argument("--routing-assignment", choices=["hard", "soft"], default="hard",
+                        help="Hard agreed-class mass or legacy soft mass within reliable targets")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.scene_shift_only and not args.scene_shift:
@@ -665,7 +673,10 @@ def main():
             "reliability_routing": args.reliability_routing,
             "prototype_mode": "batch_same_forward" if args.reliability_routing else "epoch_global",
             "lambda_intra": args.lambda_intra,
-            "target_weight": None if args.scene_shift_only else ("q" if args.scene_shift else args.weight_mode),
+            "routing_assignment": args.routing_assignment,
+            "target_weight": None if args.scene_shift_only else (
+                "reliable_hard_uniform" if args.reliability_routing and args.routing_assignment == "hard" else
+                ("q" if args.scene_shift else args.weight_mode)),
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
             "official_file_sha256": hashlib.sha256(original.encode()).hexdigest(),
@@ -694,7 +705,7 @@ def main():
         "audit_split": audit_split,
         "audit_epoch": audit_epoch,
         "global_source_prototypes": global_source_prototypes,
-        "adaptation": adaptation,
+        "adaptation": lambda *a, **kw: adaptation(*a, **kw, routing_assignment=args.routing_assignment),
         "diagnostics": diagnostics,
         "flow_variant": args.variant,
         "weight_mode": args.weight_mode,
@@ -723,6 +734,7 @@ def main():
               "fm_backprop_source": args.fm_backprop_source,
               "reliability_routing": args.reliability_routing,
               "lambda_intra": args.lambda_intra,
+              "routing_assignment": args.routing_assignment,
               "diagnostic_best_oa": best_diagnostic["oa"],
               "diagnostic_best_epoch": best_diagnostic["epoch"],
               "epoch100_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"]}
