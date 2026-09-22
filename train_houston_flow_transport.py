@@ -156,6 +156,7 @@ class EpochDiagnostics:
         self.velocity_cosine_sum = self.rollout_distance_sum = self.transport_correct = 0.0
         self.transport_n = 0
         self.flow_grad_from_fm = None
+        self.source_feature_grad_from_fm = None
         self.flow_grad_from_semantic = 0.0
         self.source_correct = self.shifted_source_correct = self.source_n = 0
         self.true6_hist = torch.zeros(NUM_CLASSES, dtype=torch.long)
@@ -280,6 +281,7 @@ class EpochDiagnostics:
             ),
             "transported_accuracy": self.transport_correct / max(self.transport_n, 1),
             "flow_grad_from_fm": self.flow_grad_from_fm,
+            "source_feature_grad_from_fm": self.source_feature_grad_from_fm,
             "flow_grad_from_semantic": self.flow_grad_from_semantic,
             "target_observations": self.n,
             "batches": self.batches,
@@ -318,7 +320,7 @@ def forward_without_bn_update(model, source, target):
 
 def adaptation(model, flow, source_features, target_features, target_logits, source_labels,
                target_labels, prototypes, valid_classes, epoch, diagnostics, flow_variant,
-               weight_mode="js_product"):
+               weight_mode="js_product", fm_backprop_source=False):
     diagnostics.begin(epoch)
     with torch.no_grad():
         q = target_logits.detach().softmax(1)
@@ -350,7 +352,16 @@ def adaptation(model, flow, source_features, target_features, target_logits, sou
     rollout = pair_source
     flow_stats = None
     if len(pair_classes):
-        fm_loss, flow_stats = agreement_flow_matching_loss(flow, pair_source, pair_target, pair_classes)
+        fm_loss, flow_stats = agreement_flow_matching_loss(
+            flow, pair_source, pair_target, pair_classes,
+            detach_source=not fm_backprop_source,
+        )
+        if diagnostics.source_feature_grad_from_fm is None:
+            if fm_backprop_source:
+                source_gradient = torch.autograd.grad(fm_loss, pair_source, retain_graph=True)[0]
+                diagnostics.source_feature_grad_from_fm = float(source_gradient.detach().norm())
+            else:
+                diagnostics.source_feature_grad_from_fm = 0.0
         if diagnostics.flow_grad_from_fm is None:
             gradients = torch.autograd.grad(fm_loss, tuple(flow.parameters()), retain_graph=True)
             gradient_norm = torch.stack([gradient.detach().norm() for gradient in gradients]).square().sum().sqrt()
@@ -391,10 +402,19 @@ def main():
     parser.add_argument("--scene-shift", action="store_true")
     parser.add_argument("--scene-shift-only", action="store_true",
                         help="Fair SceneShift control: averaged source/shifted-source CE only")
+    parser.add_argument("--scene-shift-aux-original-flow", action="store_true",
+                        help=("Keep shifted source as an auxiliary CE view, but use the "
+                              "original source/target forward for q-only OT and Flow"))
+    parser.add_argument("--fm-backprop-source", action="store_true",
+                        help="Allow FM loss to update the backbone through source OT features")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
     if args.scene_shift_only and not args.scene_shift:
         parser.error("--scene-shift-only requires --scene-shift")
+    if args.scene_shift_aux_original_flow and not args.scene_shift:
+        parser.error("--scene-shift-aux-original-flow requires --scene-shift")
+    if args.scene_shift_aux_original_flow and args.scene_shift_only:
+        parser.error("--scene-shift-aux-original-flow cannot be combined with --scene-shift-only")
     if args.mode == "self-test":
         torch.manual_seed(args.seed)
         ns, nt, dim, classes = 19, 13, 11, NUM_CLASSES
@@ -489,7 +509,25 @@ def main():
             fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
                 feature_encoder, flow, shifted_features, target_features_ss, target_outputs_ss,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant, "q")
+                epoch, diagnostics, flow_variant, "q", fm_backprop_source)
+'''
+    scene_aux_original_flow_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
+            diagnostics.begin(epoch)
+            (source_features, source1, _, source_outputs, source_out,
+             target_features, _, target1, target_outputs, target_out) = feature_encoder(
+                    source_data.cuda(), target_data.cuda())
+            (shifted_features, _, _, shifted_outputs, _,
+             target_features_ss, _, _, target_outputs_ss, _) = forward_without_bn_update(
+                    feature_encoder, shifted_data, target_data.cuda())
+            cls_loss = 0.5 * (crossEntropy(source_outputs, source_label.cuda()) + crossEntropy(shifted_outputs, source_label.cuda()))
+            diagnostics.observe_scene_shift(source_outputs.detach(), shifted_outputs.detach(), source_label.cuda(),
+                                            source_features.detach(), shifted_features.detach(), target_features.detach())
+            # The shifted view is auxiliary classification supervision only.  OT and
+            # Flow use the original source/target pair from the first forward.
+            fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
+                feature_encoder, flow, source_features, target_features, target_outputs,
+                source_label.cuda(), target_label, prototypes, valid_classes,
+                epoch, diagnostics, flow_variant, "q", fm_backprop_source)
 '''
     base_forward = '''            (source_features, source1, _, source_outputs, source_out,
              target_features, _, target1, target_outputs, target_out) = feature_encoder(
@@ -498,7 +536,7 @@ def main():
             fm_loss, semantic_loss, flow_stats, rollout, pair_target, pair_classes = adaptation(
                 feature_encoder, flow, source_features, target_features, target_outputs,
                 source_label.cuda(), target_label, prototypes, valid_classes,
-                epoch, diagnostics, flow_variant, weight_mode)
+                epoch, diagnostics, flow_variant, weight_mode, fm_backprop_source)
 '''
     scene_only_forward = '''            shifted_data = scene_shift_batch(source_data.cuda(), *scene_stats, alpha=0.8)
             diagnostics.begin(epoch)
@@ -528,7 +566,15 @@ def main():
                 prototypes, valid_classes = global_source_prototypes(
                     feature_encoder, trainX, trainY, target_data.cuda(), scene_stats if scene_shift_enabled else None)
 '''
-    replacement = prototype_prefix + (scene_only_forward if args.scene_shift_only else (scene_forward if args.scene_shift else base_forward)) + '''
+    if args.scene_shift_only:
+        selected_forward = scene_only_forward
+    elif args.scene_shift_aux_original_flow:
+        selected_forward = scene_aux_original_flow_forward
+    elif args.scene_shift:
+        selected_forward = scene_forward
+    else:
+        selected_forward = base_forward
+    replacement = prototype_prefix + selected_forward + '''
             loss = cls_loss + fm_loss
             diagnostics.observe_losses(cls_loss, fm_loss, semantic_loss, flow_stats,
                                        rollout, pair_target, pair_classes, feature_encoder.fc1)
@@ -555,6 +601,8 @@ def main():
             "seed": args.seed, "epochs": args.epochs, "variant": args.variant,
             "scene_shift": args.scene_shift, "scene_shift_alpha": 0.8 if args.scene_shift else 0.0,
             "scene_shift_only": args.scene_shift_only,
+            "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
+            "fm_backprop_source": args.fm_backprop_source,
             "target_weight": None if args.scene_shift_only else ("q" if args.scene_shift else args.weight_mode),
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
@@ -593,6 +641,7 @@ def main():
         "forward_without_bn_update": forward_without_bn_update,
         "scene_shift_enabled": args.scene_shift,
         "scene_shift_only": args.scene_shift_only,
+        "fm_backprop_source": args.fm_backprop_source,
         "ConditionalFlowMLP": ConditionalFlowMLP,
     }
     (out / "executed.py").write_text(code)
@@ -600,8 +649,13 @@ def main():
     exec(compile(code, str(official_path), "exec"), namespace)
     best_diagnostic = max(history, key=lambda row: row["oa"])
     result = {"epoch": args.epochs, **history[-1], "selection": f"fixed_epoch{args.epochs}",
-              "method": "scene_shift_only" if args.scene_shift_only else "flow_transport",
+              "method": (
+                  "scene_shift_only" if args.scene_shift_only else
+                  ("scene_shift_aux_original_flow" if args.scene_shift_aux_original_flow else "flow_transport")
+              ),
               "scene_shift_only": args.scene_shift_only,
+              "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
+              "fm_backprop_source": args.fm_backprop_source,
               "diagnostic_best_oa": best_diagnostic["oa"],
               "diagnostic_best_epoch": best_diagnostic["epoch"],
               "epoch100_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"]}

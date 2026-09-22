@@ -34,9 +34,10 @@ class AgreementFlowMLP(nn.Module):
 
 
 def agreement_flow_matching_loss(flow: nn.Module, source: Tensor, target: Tensor,
-                                 class_labels: Tensor):
-    """FM on detached OT pairs; returns loss and detached diagnostics."""
-    source, target = source.detach(), target.detach()
+                                 class_labels: Tensor, detach_source: bool = True):
+    """FM on OT pairs, optionally allowing the source path to update its encoder."""
+    source = source.detach() if detach_source else source
+    target = target.detach()
     time = torch.rand(len(source), device=source.device)
     state = (1.0 - time[:, None]) * source + time[:, None] * target
     original_velocity = target - source
