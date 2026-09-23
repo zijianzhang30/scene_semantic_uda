@@ -23,11 +23,17 @@ def compare(root, seed=1341, epochs=5):
                        for a, b in zip(*rows) if a != b]
         evaluation_equal = all(all(a[k] == b[k] for k in (
             "oa", "aa", "kappa", "per_class_accuracy")) for a, b in zip(*histories))
-        passed = complete and same_start and same_code and not differences and evaluation_equal
+        selection_equal = True
+        if any("source_val_accuracy" in h[0] for h in histories):
+            selection_equal = all(all(a.get(k) == b.get(k) for k in (
+                "source_val_accuracy", "source_val_loss")) for a, b in zip(*histories))
+            selected = [max(h, key=lambda row: row["source_val_accuracy"]) for h in histories]
+            selection_equal &= selected[0]["epoch"] == selected[1]["epoch"]
+        passed = complete and same_start and same_code and not differences and evaluation_equal and selection_equal
         report["pairs"][left + "/" + right] = {
             "passed": passed, "steps": [len(r) for r in rows], "complete": complete,
             "same_initialization_and_split": same_start, "same_code": same_code,
-            "evaluation_equal": evaluation_equal,
+            "evaluation_equal": evaluation_equal, "source_selection_equal": selection_equal,
             "mismatch_steps": len(differences), "first_mismatch": differences[:1],
         }
         report["passed"] &= passed

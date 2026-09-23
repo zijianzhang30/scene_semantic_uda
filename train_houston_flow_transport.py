@@ -36,6 +36,9 @@ from class_conditional_flow import (
     sample_ot_pairs,
 )
 
+from source_val_protocol import (validation_data, evaluate_source, evaluate_target,
+                                 isolated_evaluation, atomic_save, improves_source_validation)
+
 NUM_CLASSES = 7
 EPS = 1e-8
 
@@ -149,7 +152,7 @@ def scene_shift_batch(x, source_mean, source_std, target_mean, target_std, alpha
 
 
 def forward_without_bn_update(model, source, target):
-    """Second SceneShift view: retain gradients but do not update BN buffers again."""
+    """Historical running-statistics control, retained only for B_loss."""
     batch_norms = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
     states = [m.training for m in batch_norms]
     try:
@@ -159,6 +162,27 @@ def forward_without_bn_update(model, source, target):
     finally:
         for module, training in zip(batch_norms, states):
             module.train(training)
+
+
+def forward_with_batch_stats_restore_buffers(model, source, target):
+    """Use auxiliary batch statistics without retaining BN running updates."""
+    saved = []
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            buffers = {name: None if getattr(module, name) is None else
+                       getattr(module, name).detach().clone()
+                       for name in ("running_mean", "running_var", "num_batches_tracked")}
+            saved.append((module, module.training, buffers))
+    try:
+        for module, _, _ in saved:
+            module.train()
+        return model(source, target)
+    finally:
+        for module, mode, buffers in saved:
+            # Rebind instead of copy_: backward may still reference forward buffers.
+            for name, value in buffers.items():
+                setattr(module, name, value)
+            module.training = mode
 
 
 
@@ -172,6 +196,8 @@ ABLATIONS = {
     # Isolate OT/Flow from SceneShift.
     "F": (False, True, False, False),
     "G": (False, True, True, False),
+    "B_BN": (True, False, False, False),  # Alias of corrected B; preserves the screen name.
+    "B_loss": (True, False, False, False),
 }
 
 
@@ -217,9 +243,13 @@ def training_step(model, flow, source_data, target_data, labels, scene_stats, ab
         shifted = scene_shift_batch(source_data, *scene_stats, alpha=0.8)
         # Auxiliary dropout must not advance the original-view RNG stream.
         with torch.random.fork_rng(devices=[source_data.device.index]):
-            shifted_outputs = forward_without_bn_update(model, shifted, target_data)
+            auxiliary_forward = (forward_with_batch_stats_restore_buffers
+                                 if ablation != "B_loss" else forward_without_bn_update)
+            shifted_outputs = auxiliary_forward(model, shifted, target_data)
         ce_ss = F.cross_entropy(shifted_outputs[3], labels)
     ce = ce_s if ce_ss is None else 0.5 * (ce_s + ce_ss)
+    if ablation == "B_loss":
+        ce = ce_s + 0.5 * ce_ss
     fm = ce.new_zeros(())
     details = None
     if use_flow:
@@ -359,13 +389,21 @@ def metrics_from_predictions(predictions, labels):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["prepare", "train", "self-test"], default="train")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr-horizon", type=int, default=None,
+                        help="Keep the full-run LR schedule during short screening runs")
     parser.add_argument("--seed", type=int, default=1341)
     parser.add_argument("--variant", choices=["flow_a"], default="flow_a")
     parser.add_argument("--ablation", choices=list(ABLATIONS), default="C",
                         help="A=CE_s, B=SceneShift, C=OT/Flow, D=source FM backprop, E=soft reliability")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
+    parser.add_argument("--selection", choices=["source_val_best", "fixed_epoch"],
+                        default="source_val_best")
     args = parser.parse_args()
+    if args.lr_horizon is None:
+        args.lr_horizon = args.epochs
+    if not 1 <= args.epochs <= args.lr_horizon:
+        parser.error("Require 1 <= epochs <= lr-horizon")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
@@ -391,7 +429,7 @@ def main():
         logits = model(source)
         fm, details = adaptation(flow, source, target, logits, labels, args.fm_backprop_source, args.reliability_routing, flow_rng)
         if not ABLATIONS[args.ablation][1]:
-            assert args.ablation in ("A", "B")
+            assert args.ablation in ("A", "B", "B_BN", "B_loss")
             fm = fm.detach() * 0.0
         ce = F.cross_entropy(logits, labels)
         loss = ce + fm
@@ -448,11 +486,46 @@ def main():
     code = original
     # The generated official loop calls the common training_step for every A-G.
     replacement = build_training_code(code)
-    code = replacement
+    code = replacement.replace("(epoch - 1) / epochs", "(epoch - 1) / lr_horizon")
     history = []
     diagnostics = EpochDiagnostics()
+    validation = {}
+    selected_row = None
 
     def audit_split(train_x, train_y, test_x, test_y, model):
+        if args.selection == "source_val_best":
+            _, source_gt = utils.load_data_houston(
+                str(LEGACY / "datasets/Houston/Houston13.mat"),
+                str(LEGACY / "datasets/Houston/Houston13_7gt.mat"))
+            _, target_gt = utils.load_data_houston(
+                str(LEGACY / "datasets/Houston/Houston18.mat"),
+                str(LEGACY / "datasets/Houston/Houston18_7gt.mat"))
+            loader, reference, split = validation_data(
+                cached["s"], source_gt, args.seed, train_x, train_y)
+            np.savez(out / "source_validation_split.npz", **split)
+            validation.update(loader=loader, reference=reference, target_gt=target_gt)
+            (out / "selection_protocol.json").write_text(json.dumps({
+                "selection": args.selection, "metric": "source validation OA",
+                "tie_rule": "earliest epoch", "source_forward": "model(x,x)[3]",
+                "source_train_n": len(train_y),
+                "source_validation_n": len(loader.dataset),
+                "source_validation_labels_hash": sha(split["validation_labels"]),
+                "source_validation_centers_hash": sha(split["validation_centers"]),
+                "target_forward": "model(train_x[:32], target_batch)[8]",
+                "target_order": "row-major labelled centers",
+                "target_drop_last": False,
+                "target_evaluated_n": int((target_gt > 0).sum()),
+                "target_metrics_used_for_selection": False,
+                "historical_reference": "4b467cba:train_full_mluda_scene_shift.py",
+                "training_protocol": "current A-G; not historical full-MLUDA training",
+                "lr_horizon": args.lr_horizon,
+                "protocol_version": "sourceval_bn_batch_restore_v2",
+                "auxiliary_bn": ("none" if not args.scene_shift else
+                                 "running_stats" if args.ablation == "B_loss" else
+                                 "batch_stats_restore_buffers"),
+                "ce_weights": ([1.0, 0.0] if not args.scene_shift else
+                               [1.0, 0.5] if args.ablation == "B_loss" else [0.5, 0.5]),
+            }, indent=2))
         manifest = {
             "source_x": sha(train_x), "source_y": sha(train_y),
             "target_x": sha(test_x), "target_y": sha(test_y),
@@ -478,17 +551,41 @@ def main():
     @torch.no_grad()
     @torch.random.fork_rng(devices=[torch.cuda.current_device()])
     def audit_epoch(epoch, model, source_context, test_loader):
-        was_training = model.training
-        model.eval()
-        predictions, labels = [], []
-        for target_data, target_label in test_loader:
-            outputs = model(source_context.cuda(), target_data.cuda())[8]
-            predictions.extend(outputs.argmax(1).cpu().tolist())
-            labels.extend(target_label.tolist())
-        model.train(was_training)
-        row = {"epoch": epoch, **diagnostics.summary(), **metrics_from_predictions(np.asarray(predictions), np.asarray(labels))}
+        nonlocal selected_row
+        with isolated_evaluation(model):
+            if args.selection == "source_val_best":
+                val_loss, val_accuracy = evaluate_source(model, validation["loader"], "cuda")
+                target_metrics = evaluate_target(
+                    model, cached["t"], validation["target_gt"],
+                    validation["reference"], "cuda")
+                row = {"epoch": epoch, **diagnostics.summary(), **target_metrics,
+                       "evaluated_n": target_metrics["num_target_evaluation_samples"],
+                       "source_val_loss": val_loss, "source_val_accuracy": val_accuracy}
+            else:
+                predictions, labels = [], []
+                for target_data, target_label in test_loader:
+                    outputs = model(source_context.cuda(), target_data.cuda())[8]
+                    predictions.extend(outputs.argmax(1).cpu().tolist())
+                    labels.extend(target_label.tolist())
+                row = {"epoch": epoch, **diagnostics.summary(),
+                       **metrics_from_predictions(np.asarray(predictions), np.asarray(labels))}
         history.append(row)
         (out / "history.json").write_text(json.dumps(history, indent=2))
+        if args.selection == "source_val_best":
+            checkpoint = {
+                "model": model.state_dict(), "flow": namespace["flow"].state_dict(),
+                "optimizer": namespace["optimizer"].state_dict(),
+                "metrics": row, "epoch": epoch, "selection": args.selection,
+                "seed": args.seed, "ablation": args.ablation,
+                "cpu_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all(),
+                "numpy_rng": np.random.get_state(), "python_rng": random.getstate(),
+                "flow_rng": namespace["flow_rng"].get_state(),
+            }
+            if improves_source_validation(row, selected_row):
+                selected_row = dict(row)
+                atomic_save(checkpoint, out / "best_source_val.pth")
+                (out / "best_source_val.json").write_text(json.dumps(selected_row, indent=2))
+            atomic_save(checkpoint, out / "last.pth")
         print("AGREEMENT_EPOCH", json.dumps(row), flush=True)
 
     def audit_step(epoch, index, model, step, source_data, target_data, labels):
@@ -515,6 +612,7 @@ def main():
 
     namespace = {
         "__name__": "__main__",
+        "lr_horizon": args.lr_horizon,
         "audit_split": audit_split,
         "audit_epoch": audit_epoch,
         "audit_step": audit_step,
@@ -540,7 +638,7 @@ def main():
     snapshot = out / "code_snapshot"
     snapshot.mkdir()
     provenance = {}
-    for path in [Path(__file__), ROOT / "class_conditional_flow.py", official_path,
+    for path in [Path(__file__), ROOT / "source_val_protocol.py", ROOT / "class_conditional_flow.py", official_path,
                  LEGACY / "net2.py", LEGACY / "utils.py", LEGACY / "UtilsCMS.py",
                  LEGACY / "config_Houston.py"]:
         data = path.read_bytes()
@@ -557,7 +655,10 @@ def main():
     os.chdir(LEGACY)
     exec(compile(code, str(official_path), "exec"), namespace)
     best_diagnostic = max(history, key=lambda row: row["oa"])
-    result = {"epoch": args.epochs, **history[-1], "selection": f"fixed_epoch{args.epochs}",
+    chosen = selected_row if args.selection == "source_val_best" else history[-1]
+    result = {**chosen, "training_epochs": args.epochs,
+              "lr_horizon": args.lr_horizon,
+              "selection": "source_val_best" if selected_row else f"fixed_epoch{args.epochs}",
               "method": (
                   "scene_shift_only" if args.scene_shift_only else
                   ("scene_shift_aux_original_flow" if args.scene_shift_aux_original_flow else "flow_transport")
@@ -576,7 +677,13 @@ def main():
         result["epoch100_minus_best_oa"] = result["fixed_epoch_minus_best_oa"]
         result["epoch100_best_drop"] = result["fixed_epoch_best_drop"]
     result["gpu_max_allocated"] = torch.cuda.max_memory_allocated()
-    torch.save({"model": namespace["feature_encoder"].state_dict(), "flow": namespace["flow"].state_dict(), "metrics": result}, out / f"epoch{args.epochs}.pth")
+    final_metrics = {**history[-1], "selection": f"fixed_epoch{args.epochs}"}
+    result["fixed_epoch_metrics"] = final_metrics
+    result["selected_checkpoint"] = "best_source_val.pth" if selected_row else f"epoch{args.epochs}.pth"
+    result["best_epoch"] = chosen["epoch"]
+    atomic_save({"model": namespace["feature_encoder"].state_dict(),
+                 "flow": namespace["flow"].state_dict(), "metrics": final_metrics},
+                out / f"epoch{args.epochs}.pth")
     (out / "results.json").write_text(json.dumps(result, indent=2))
     print("FINAL", json.dumps(result), flush=True)
 
