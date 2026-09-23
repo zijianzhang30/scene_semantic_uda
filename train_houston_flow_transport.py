@@ -1,4 +1,4 @@
-"""Houston A-E ablations on the unchanged official MLUDA data/model protocol.
+"""Houston A-G ablations on the unchanged official MLUDA data/model protocol.
 
 Only original-source CE, auxiliary SceneShift CE and class-wise cosine OT/FM
 are optimized. Target labels are used solely for detached diagnostics/evaluation.
@@ -9,9 +9,12 @@ import argparse
 import hashlib
 import json
 import os
+import random
 from pathlib import Path
 import sys
 from typing import Dict, Tuple
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
 import torch
@@ -39,6 +42,62 @@ EPS = 1e-8
 
 def sha(array: np.ndarray) -> str:
     return hashlib.sha256(np.asarray(array).tobytes()).hexdigest()
+
+
+class _DeterministicGlobalPool(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        ctx.shape = value.shape
+        return F.avg_pool3d(value, (1, value.shape[-2], value.shape[-1]))
+
+    @staticmethod
+    def backward(ctx, gradient):
+        # Global, non-overlapping pooling: every input receives exactly one term.
+        area = gradient.new_tensor(ctx.shape[-2] * ctx.shape[-1])
+        return (gradient / area).expand(ctx.shape).contiguous()
+
+
+class _DeterministicGlobalMaxPool(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        result, indices = F.adaptive_max_pool2d(value, 1, return_indices=True)
+        ctx.shape = value.shape
+        ctx.save_for_backward(indices)
+        return result
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (indices,) = ctx.saved_tensors
+        positions = torch.arange(ctx.shape[-2] * ctx.shape[-1], device=gradient.device)
+        mask = positions.reshape(1, 1, *ctx.shape[-2:]) == indices
+        return gradient * mask
+
+
+def install_deterministic_pool(model):
+    pool = model.feature_layers.avgpool
+    assert isinstance(pool, nn.AvgPool3d)
+    assert pool.kernel_size == (1, model.feature_layers.sz, model.feature_layers.sz)
+    # Preserve the official forward kernel and state_dict; replace only backward.
+    pool.forward = _DeterministicGlobalPool.apply
+    max_pool = model.feature_layers.ca.max_pool
+    assert isinstance(max_pool, nn.AdaptiveMaxPool2d) and max_pool.output_size == 1
+    max_pool.forward = _DeterministicGlobalMaxPool.apply
+    return model
+
+
+def tensor_sequence_hash(tensors) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str((tuple(value.shape), value.dtype)).encode())
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def parameter_hash(model) -> str:
+    return hashlib.sha256(b"".join(
+        p.detach().cpu().numpy().tobytes() for p in model.parameters()
+    )).hexdigest()
 
 
 @torch.no_grad()
@@ -129,21 +188,25 @@ def target_membership(source, labels, target, logits, reliability):
     return q, keep
 
 
-def adaptation(flow, source, target, logits, labels, backprop, reliability):
+def adaptation(flow, source, target, logits, labels, backprop, reliability, flow_rng):
+    if not isinstance(flow_rng, torch.Generator):
+        raise TypeError("OT/Flow requires an explicit torch.Generator")
     q, keep = target_membership(source, labels, target, logits, reliability)
     ot = classwise_cosine_ot(source, labels, target, q, NUM_CLASSES, target_mask=keep)
     pair_source, pair_target, pair_classes = sample_ot_pairs(
-        ot, source, target.detach(), max_pairs_per_class=32)
+        ot, source, target.detach(), max_pairs_per_class=32,
+        generator=flow_rng)
     fm = source.new_zeros(())
     stats = None
     if len(pair_classes):
         fm, stats = agreement_flow_matching_loss(
-            flow, pair_source, pair_target, pair_classes, detach_source=not backprop)
+            flow, pair_source, pair_target, pair_classes, detach_source=not backprop,
+            generator=flow_rng)
     assert torch.isfinite(fm)
     return fm, {"q": q, "keep": keep, "ot": ot, "pair_classes": pair_classes, "stats": stats}
 
 
-def training_step(model, flow, source_data, target_data, labels, scene_stats, ablation):
+def training_step(model, flow, source_data, target_data, labels, scene_stats, ablation, flow_rng):
     """One common original-source/target forward for every ablation."""
     shift, use_flow, backprop, reliability = ABLATIONS[ablation]
     outputs = model(source_data, target_data)
@@ -152,13 +215,15 @@ def training_step(model, flow, source_data, target_data, labels, scene_stats, ab
     ce_ss = None
     if shift:
         shifted = scene_shift_batch(source_data, *scene_stats, alpha=0.8)
-        shifted_outputs = forward_without_bn_update(model, shifted, target_data)
+        # Auxiliary dropout must not advance the original-view RNG stream.
+        with torch.random.fork_rng(devices=[source_data.device.index]):
+            shifted_outputs = forward_without_bn_update(model, shifted, target_data)
         ce_ss = F.cross_entropy(shifted_outputs[3], labels)
     ce = ce_s if ce_ss is None else 0.5 * (ce_s + ce_ss)
     fm = ce.new_zeros(())
     details = None
     if use_flow:
-        fm, details = adaptation(flow, source, target, outputs[8], labels, backprop, reliability)
+        fm, details = adaptation(flow, source, target, outputs[8], labels, backprop, reliability, flow_rng)
     return {"loss": ce + fm, "ce": ce, "ce_s": ce_s, "ce_ss": ce_ss, "fm": fm,
             "source_logits": outputs[3], "target_logits": outputs[8],
             "source_features": source, "target_features": target, "details": details}
@@ -232,17 +297,31 @@ def build_training_code(original):
         return code.replace(old, new, 1)
     code = replace_once(original, '    print("Training...")',
                         '    audit_split(trainX, trainY, testX, testY, feature_encoder)\n    print("Training...")')
-    # Keep Flow initialization/RNG consumption identical across A-E and the old
-    # flow_a runner. In A/B it is dormant and receives no gradient or updates.
+    code = replace_once(code, 'utils.set_seed(seeds[iDataSet])',
+                        'utils.set_seed(seeds[iDataSet])\n'
+                        '    flow_rng = torch.Generator(device="cpu")\n'
+                        '    flow_rng.manual_seed(args_flow["sampling_seed"])')
+    # Initialize the auxiliary Flow without advancing the official RNG stream.
     code = replace_once(code, 'feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()',
-                        'feature_encoder = DSANSS(nBand, patch_size, CLASS_NUM).cuda()\n    flow = ConditionalFlowMLP(288, CLASS_NUM, hidden_dim=288).cuda()')
+                        'feature_encoder = install_deterministic_pool(DSANSS(nBand, patch_size, CLASS_NUM).cuda())\n'
+                        '    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):\n'
+                        '        torch.random.default_generator.manual_seed(args_flow["init_seed"])\n'
+                        '        torch.cuda.manual_seed(args_flow["init_seed"])\n'
+                        '        flow = ConditionalFlowMLP(288, CLASS_NUM, hidden_dim=288).cuda()')
     code = replace_once(code, "{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},",
                         "{'params': feature_encoder.head2.parameters(), 'lr': LEARNING_RATE},\n            {'params': flow.parameters(), 'lr': LEARNING_RATE},")
     code = replace_once(code, 'feature_encoder.train()', 'feature_encoder.train()\n        flow.train()')
+    code = replace_once(code, '            optimizer.step()',
+                        '            optimizer.step()\n'
+                        '            audit_step(epoch, i, feature_encoder, step, source_data, target_data, source_label)')
+    code = replace_once(code, '        iter_source = iter(train_loader_s)',
+                        '        flow_rng = torch.Generator(device="cpu")\n'
+                        '        flow_rng.manual_seed(args_flow["sampling_seed"] + epoch)\n'
+                        '        iter_source = iter(train_loader_s)')
     start = code.index('            # 0\n')
     end = code.index('            # Update parameters', start)
     step = '''            step = training_step(feature_encoder, flow, source_data.cuda(),
-                                 target_data.cuda(), source_label.cuda(), scene_stats, ablation)
+                                 target_data.cuda(), source_label.cuda(), scene_stats, ablation, flow_rng)
             loss, cls_loss = step['loss'], step['ce']
             source_outputs = step['source_logits']
             diagnostics.observe(epoch, step, source_label, target_label, flow)
@@ -287,6 +366,9 @@ def main():
                         help="A=CE_s, B=SceneShift, C=OT/Flow, D=source FM backprop, E=soft reliability")
     parser.add_argument("--out", type=Path, default=ROOT / "runs_agreement_transport_1341")
     args = parser.parse_args()
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     scene_shift, use_flow, backprop, reliability = ABLATIONS[args.ablation]
     args.scene_shift = scene_shift
     args.scene_shift_only = not use_flow and scene_shift
@@ -296,12 +378,18 @@ def main():
     if args.mode == "self-test":
         torch.manual_seed(args.seed)
         model = nn.Linear(8, NUM_CLASSES)
+        cpu_rng = torch.get_rng_state()
+        cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         flow = ConditionalFlowMLP(8, NUM_CLASSES, hidden_dim=16)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        flow_rng = torch.Generator(device="cpu").manual_seed(args.seed + 99173)
         source = torch.randn(12, 8, requires_grad=True)
         target = torch.randn(12, 8)
         labels = torch.arange(12) % NUM_CLASSES
         logits = model(source)
-        fm, details = adaptation(flow, source, target, logits, labels, args.fm_backprop_source, args.reliability_routing)
+        fm, details = adaptation(flow, source, target, logits, labels, args.fm_backprop_source, args.reliability_routing, flow_rng)
         if not ABLATIONS[args.ablation][1]:
             assert args.ablation in ("A", "B")
             fm = fm.detach() * 0.0
@@ -351,13 +439,14 @@ def main():
     cfg.epochs = args.epochs
     out = args.out / args.variant
     out.mkdir(exist_ok=True)
+    if any(out.iterdir()):
+        raise FileExistsError(f"Refusing to mix audit records in nonempty {out}")
     official_path = LEGACY / "MLUDA_hu.py"
     original = official_path.read_text()
-    code = original.replace(
-        '    print("Training...")',
-        '    audit_split(trainX, trainY, testX, testY, feature_encoder)\n    print("Training...")',
-    )
-    # The generated official loop calls the common training_step for every A-E.
+    flow_init_seed = args.seed + 71039
+    flow_sampling_seed = args.seed + 99173
+    code = original
+    # The generated official loop calls the common training_step for every A-G.
     replacement = build_training_code(code)
     code = replacement
     history = []
@@ -376,7 +465,7 @@ def main():
             "scene_shift_aux_original_flow": args.scene_shift_aux_original_flow,
             "fm_backprop_source": args.fm_backprop_source,
             "reliability_routing": args.reliability_routing,
-            "prototype_mode": "batch_same_forward" if args.reliability_routing else "epoch_global",
+            "prototype_mode": "batch_original_source" if args.reliability_routing else "unused",
             "target_weight": "q" if not args.reliability_routing else "filtered_soft_q",
             "source_counts": np.bincount(train_y).tolist(),
             "source_n": len(train_y), "target_n": len(test_y),
@@ -387,6 +476,7 @@ def main():
         print("SPLIT", json.dumps(manifest), flush=True)
 
     @torch.no_grad()
+    @torch.random.fork_rng(devices=[torch.cuda.current_device()])
     def audit_epoch(epoch, model, source_context, test_loader):
         was_training = model.training
         model.eval()
@@ -401,13 +491,39 @@ def main():
         (out / "history.json").write_text(json.dumps(history, indent=2))
         print("AGREEMENT_EPOCH", json.dumps(row), flush=True)
 
+    def audit_step(epoch, index, model, step, source_data, target_data, labels):
+        row = {
+            "epoch": epoch, "step": index,
+            "feature_encoder_hash": parameter_hash(model),
+            "backbone_hash": parameter_hash(model.feature_layers),
+            "classifier_hash": parameter_hash(model.fc1),
+            "buffers_hash": tensor_sequence_hash(model.buffers()),
+            "gradient_hash": tensor_sequence_hash(
+                p.grad if p.grad is not None else torch.empty(0) for p in model.parameters()),
+            "ce": float(step["ce"].detach()),
+            "ce_s": float(step["ce_s"].detach()),
+            "ce_ss": float(step["ce_ss"].detach()) if step["ce_ss"] is not None else None,
+            "source_logits_hash": tensor_sequence_hash([step["source_logits"]]),
+            "target_logits_hash": tensor_sequence_hash([step["target_logits"]]),
+            "source_input_hash": tensor_sequence_hash([source_data, labels]),
+            "target_input_hash": tensor_sequence_hash([target_data]),
+            "cpu_rng_hash": tensor_sequence_hash([torch.get_rng_state()]),
+            "cuda_rng_hash": tensor_sequence_hash([torch.cuda.get_rng_state()]),
+        }
+        with (out / "step_audit.jsonl").open("a") as handle:
+            handle.write(json.dumps(row) + "\n")
+
     namespace = {
         "__name__": "__main__",
         "audit_split": audit_split,
         "audit_epoch": audit_epoch,
+        "audit_step": audit_step,
+        "args_flow": {"init_seed": args.seed + 71039, "sampling_seed": args.seed + 99173},
         "adaptation": adaptation,
         "training_step": training_step,
         "ablation": args.ablation,
+        "flow_init_seed": flow_init_seed,
+        "flow_sampling_seed": flow_sampling_seed,
         "diagnostics": diagnostics,
         "weight_mode": "q",
         "scene_stats": scene_stats,
@@ -419,7 +535,24 @@ def main():
         "fm_backprop_source": args.fm_backprop_source,
         "reliability_routing": args.reliability_routing,
         "ConditionalFlowMLP": ConditionalFlowMLP,
+        "install_deterministic_pool": install_deterministic_pool,
     }
+    snapshot = out / "code_snapshot"
+    snapshot.mkdir()
+    provenance = {}
+    for path in [Path(__file__), ROOT / "class_conditional_flow.py", official_path,
+                 LEGACY / "net2.py", LEGACY / "utils.py", LEGACY / "UtilsCMS.py",
+                 LEGACY / "config_Houston.py"]:
+        data = path.read_bytes()
+        (snapshot / path.name).write_bytes(data)
+        provenance[str(path)] = hashlib.sha256(data).hexdigest()
+    (out / "provenance.json").write_text(json.dumps({
+        "files": provenance, "command": sys.argv, "torch": torch.__version__,
+        "cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version(),
+        "gpu": torch.cuda.get_device_name(), "deterministic": True,
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+        "cache_sha256": hashlib.sha256(cache.read_bytes()).hexdigest(),
+    }, indent=2))
     (out / "executed.py").write_text(code)
     os.chdir(LEGACY)
     exec(compile(code, str(official_path), "exec"), namespace)
@@ -436,7 +569,12 @@ def main():
                 "routing_assignment": "soft",
               "diagnostic_best_oa": best_diagnostic["oa"],
               "diagnostic_best_epoch": best_diagnostic["epoch"],
-              "epoch100_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"]}
+              "fixed_epoch_minus_best_oa": history[-1]["oa"] - best_diagnostic["oa"],
+              "fixed_epoch_best_drop": best_diagnostic["oa"] - history[-1]["oa"],
+              "ablation": args.ablation, "seed": args.seed}
+    if args.epochs == 100:
+        result["epoch100_minus_best_oa"] = result["fixed_epoch_minus_best_oa"]
+        result["epoch100_best_drop"] = result["fixed_epoch_best_drop"]
     result["gpu_max_allocated"] = torch.cuda.max_memory_allocated()
     torch.save({"model": namespace["feature_encoder"].state_dict(), "flow": namespace["flow"].state_dict(), "metrics": result}, out / f"epoch{args.epochs}.pth")
     (out / "results.json").write_text(json.dumps(result, indent=2))

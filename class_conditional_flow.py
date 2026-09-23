@@ -34,11 +34,13 @@ class AgreementFlowMLP(nn.Module):
 
 
 def agreement_flow_matching_loss(flow: nn.Module, source: Tensor, target: Tensor,
-                                 class_labels: Tensor, detach_source: bool = True):
+                                 class_labels: Tensor, detach_source: bool = True,
+                                 generator: Optional[torch.Generator] = None):
     """FM on OT pairs, optionally allowing the source path to update its encoder."""
     source = source.detach() if detach_source else source
     target = target.detach()
-    time = torch.rand(len(source), device=source.device)
+    sampling_device = generator.device if generator is not None else source.device
+    time = torch.rand(len(source), device=sampling_device, generator=generator).to(source.device)
     state = (1.0 - time[:, None]) * source + time[:, None] * target
     original_velocity = target - source
     scale = math.sqrt(source.shape[1])
@@ -161,6 +163,7 @@ def sample_ot_pairs(
     source_features: Tensor,
     target_features: Tensor,
     max_pairs_per_class: Optional[int] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Construct weighted source-target pairs by taking all or top coupling entries."""
     src, tgt, labels, weights = [], [], [], []
@@ -169,7 +172,10 @@ def sample_ot_pairs(
         flat = coupling.flatten()
         count = flat.numel() if max_pairs_per_class is None else min(max_pairs_per_class, flat.numel())
         prob = flat / flat.sum().clamp_min(1e-12)
-        chosen = torch.multinomial(prob, count, replacement=True)
+        if generator is not None and torch.device(generator.device).type != prob.device.type:
+            chosen = torch.multinomial(prob.cpu(), count, replacement=True, generator=generator).to(prob.device)
+        else:
+            chosen = torch.multinomial(prob, count, replacement=True, generator=generator)
         si, ti = torch.unravel_index(chosen, coupling.shape)
         src.append(source_features[item["source_indices"][si]])
         tgt.append(target_features[item["target_indices"][ti]])
@@ -204,8 +210,9 @@ class ConditionalFlowMLP(nn.Module):
 
 
 def flow_matching_loss(model: ConditionalFlowMLP, source: Tensor, target: Tensor,
-                       class_labels: Tensor, tau_max: float = 0.3) -> Tensor:
-    tau = torch.rand(source.shape[0], device=source.device) * tau_max
+                       class_labels: Tensor, tau_max: float = 0.3,
+                       generator: Optional[torch.Generator] = None) -> Tensor:
+    tau = torch.rand(source.shape[0], device=source.device, generator=generator) * tau_max
     z_tau = (1.0 - tau[:, None]) * source + tau[:, None] * target
     velocity = target - source
     return F.mse_loss(model(z_tau, tau, class_labels), velocity)
